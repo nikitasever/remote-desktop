@@ -64,6 +64,9 @@ def key_ident(event, mods):
     return None
 
 
+DEFAULT_DOWNLOADS = os.path.join(os.path.expanduser("~"), "RemoteDesktop_received")
+
+
 class RemoteState:
     """Разделяемый surface удалённого экрана + потокобезопасный доступ."""
     def __init__(self):
@@ -83,11 +86,15 @@ class RemoteState:
         self.fps = 0
         self.kbps = 0
         self.show_stats = True    # Ctrl+Alt+I — вкл/выкл
+        # Remote file browser state
+        self.dir_listing = None   # последний ответ от host (dict)
+        self.downloads_dir = DEFAULT_DOWNLOADS  # куда складывать принятые файлы
 
 
-def reader_thread(sock, chan, state, clip):
+def reader_thread(sock, chan, state, clip, sender=None):
     """Фоновый поток: принимает кадры и обновляет surface."""
     decoder = None
+    incoming_file = {"f": None, "name": None}
     try:
         while state.alive:
             mt, body = common.recv_frame(sock, chan)
@@ -138,10 +145,42 @@ def reader_thread(sock, chan, state, clip):
                     state.rtt_ms = (time.time() - t0) * 1000.0
             elif mt == common.MSG_CLIPBOARD:
                 clip.on_remote(common.parse_json(body).get("text", ""))
+            elif mt == common.MSG_HOST_FILE_META:
+                meta = common.parse_json(body)
+                dl = state.downloads_dir
+                os.makedirs(dl, exist_ok=True)
+                safe = os.path.basename(meta["name"]) or "file.bin"
+                path = os.path.join(dl, safe)
+                incoming_file["f"] = open(path, "wb")
+                incoming_file["name"] = path
+                print(f"[client] приём файла от host: {path} ({meta.get('size', '?')} байт)")
+            elif mt == common.MSG_HOST_FILE_CHUNK:
+                if incoming_file["f"]:
+                    incoming_file["f"].write(body)
+            elif mt == common.MSG_HOST_FILE_END:
+                if incoming_file["f"]:
+                    incoming_file["f"].close()
+                    print(f"[client] файл от host сохранён: {incoming_file['name']}")
+                    incoming_file["f"] = None
+            elif mt == common.MSG_DIR_LIST_RESP:
+                resp = common.parse_json(body)
+                with state.lock:
+                    state.dir_listing = resp
+                err = resp.get("error")
+                if err:
+                    print(f"[client] ошибка листинга: {err}")
+                else:
+                    print(f"[client] листинг '{resp.get('path', '')}': {len(resp.get('entries', []))} записей")
+                    for e in resp.get("entries", []):
+                        kind = "DIR " if e.get("is_dir") else "FILE"
+                        sz = e.get("size", 0)
+                        print(f"  {kind} {e['name']}" + (f"  ({sz} B)" if not e.get("is_dir") else ""))
     except (ConnectionError, socket.error) as e:
         print(f"[client] соединение закрыто: {e}")
     finally:
         state.alive = False
+        if incoming_file["f"]:
+            incoming_file["f"].close()
 
 
 def apply_tiles(body, state):
@@ -195,6 +234,185 @@ def send_file_dialog(sender, state):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def browse_remote(sender, state):
+    """Open a Tk dialog to enter a remote path, request directory listing,
+    and let the user pick a file to pull from the host."""
+    def worker():
+        try:
+            import tkinter as tk
+            from tkinter import simpledialog, messagebox
+
+            root = tk.Tk()
+            root.withdraw()
+
+            # Ask for directory path
+            path = simpledialog.askstring(
+                "Обзор удалённого ПК",
+                "Путь к каталогу на удалённом ПК\n(пусто = домашняя папка):",
+                parent=root)
+            if path is None:
+                root.destroy()
+                return
+            path = path.strip()
+
+            # Request listing
+            sender.send_json(common.MSG_DIR_LIST_REQ, {"path": path})
+
+            # Wait for response (up to 5 seconds)
+            deadline = time.time() + 5.0
+            listing = None
+            while time.time() < deadline:
+                with state.lock:
+                    if state.dir_listing is not None:
+                        listing = state.dir_listing
+                        state.dir_listing = None
+                        break
+                time.sleep(0.1)
+
+            if listing is None:
+                messagebox.showwarning("Таймаут", "Нет ответа от хоста.", parent=root)
+                root.destroy()
+                return
+
+            if listing.get("error"):
+                messagebox.showwarning("Ошибка", listing["error"], parent=root)
+                root.destroy()
+                return
+
+            entries = listing.get("entries", [])
+            remote_path = listing.get("path", path)
+            if not entries:
+                messagebox.showinfo("Пусто", f"Каталог '{remote_path}' пуст.", parent=root)
+                root.destroy()
+                return
+
+            # Show file picker
+            pick_win = tk.Toplevel(root)
+            pick_win.title(f"Файлы: {remote_path}")
+            pick_win.geometry("500x400")
+
+            listbox = tk.Listbox(pick_win, font=("Consolas", 10))
+            listbox.pack(fill="both", expand=True, padx=4, pady=4)
+            file_entries = []
+            for e in entries:
+                is_dir = e.get("is_dir", False)
+                name = e["name"]
+                if is_dir:
+                    display = f"[DIR]  {name}"
+                else:
+                    sz = e.get("size", 0)
+                    display = f"       {name}  ({sz} B)"
+                listbox.insert(tk.END, display)
+                file_entries.append(e)
+
+            def on_pull():
+                sel = listbox.curselection()
+                if not sel:
+                    return
+                entry = file_entries[sel[0]]
+                if entry.get("is_dir"):
+                    # Navigate into directory
+                    new_path = remote_path.rstrip("/\\") + "/" + entry["name"]
+                    pick_win.destroy()
+                    root.destroy()
+                    # Re-invoke with new path
+                    _browse_path(sender, state, new_path)
+                    return
+                # Pull file
+                full = remote_path.rstrip("/\\") + "/" + entry["name"]
+                sender.send_json(common.MSG_FILE_PULL_REQ, {"path": full})
+                print(f"[client] запрос файла: {full}")
+                pick_win.destroy()
+                root.destroy()
+
+            btn_frame = tk.Frame(pick_win)
+            btn_frame.pack(fill="x", padx=4, pady=4)
+            tk.Button(btn_frame, text="Скачать / Открыть папку", command=on_pull).pack(side="left")
+            tk.Button(btn_frame, text="Закрыть", command=lambda: (pick_win.destroy(), root.destroy())).pack(side="right")
+
+            pick_win.protocol("WM_DELETE_WINDOW", lambda: (pick_win.destroy(), root.destroy()))
+            root.mainloop()
+        except Exception as e:
+            print(f"[client] ошибка обзора: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _browse_path(sender, state, path):
+    """Request a specific path and show results (re-entry for directory navigation)."""
+    def worker():
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+
+            sender.send_json(common.MSG_DIR_LIST_REQ, {"path": path})
+
+            deadline = time.time() + 5.0
+            listing = None
+            while time.time() < deadline:
+                with state.lock:
+                    if state.dir_listing is not None:
+                        listing = state.dir_listing
+                        state.dir_listing = None
+                        break
+                time.sleep(0.1)
+
+            if listing is None or listing.get("error"):
+                return
+
+            entries = listing.get("entries", [])
+            remote_path = listing.get("path", path)
+
+            root = tk.Tk()
+            root.withdraw()
+            pick_win = tk.Toplevel(root)
+            pick_win.title(f"Файлы: {remote_path}")
+            pick_win.geometry("500x400")
+
+            listbox = tk.Listbox(pick_win, font=("Consolas", 10))
+            listbox.pack(fill="both", expand=True, padx=4, pady=4)
+            file_entries = []
+            for e in entries:
+                is_dir = e.get("is_dir", False)
+                name = e["name"]
+                if is_dir:
+                    display = f"[DIR]  {name}"
+                else:
+                    sz = e.get("size", 0)
+                    display = f"       {name}  ({sz} B)"
+                listbox.insert(tk.END, display)
+                file_entries.append(e)
+
+            def on_pull():
+                sel = listbox.curselection()
+                if not sel:
+                    return
+                entry = file_entries[sel[0]]
+                if entry.get("is_dir"):
+                    new_path = remote_path.rstrip("/\\") + "/" + entry["name"]
+                    pick_win.destroy()
+                    root.destroy()
+                    _browse_path(sender, state, new_path)
+                    return
+                full = remote_path.rstrip("/\\") + "/" + entry["name"]
+                sender.send_json(common.MSG_FILE_PULL_REQ, {"path": full})
+                print(f"[client] запрос файла: {full}")
+                pick_win.destroy()
+                root.destroy()
+
+            btn_frame = tk.Frame(pick_win)
+            btn_frame.pack(fill="x", padx=4, pady=4)
+            tk.Button(btn_frame, text="Скачать / Открыть папку", command=on_pull).pack(side="left")
+            tk.Button(btn_frame, text="Закрыть", command=lambda: (pick_win.destroy(), root.destroy())).pack(side="right")
+
+            pick_win.protocol("WM_DELETE_WINDOW", lambda: (pick_win.destroy(), root.destroy()))
+            root.mainloop()
+        except Exception as e:
+            print(f"[client] ошибка обзора: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def ping_loop(sender, state):
     """Раз в секунду шлёт PING для замера RTT."""
     while state.alive:
@@ -244,7 +462,7 @@ def run_ui(sender, state, clip):
             with state.lock:
                 state.title_dirty = False
                 cap = (f"Remote Desktop {state.w}x{state.h}  монитор {state.index}/{state.monitors}"
-                       f"   (Ctrl+Alt: Q-выход  M-монитор  S-файл  I-статистика)")
+                       f"   (Ctrl+Alt: Q-выход  M-монитор  S-отправить  D-обзор  I-статистика)")
             pygame.display.set_caption(cap)
 
         for event in pygame.event.get():
@@ -276,6 +494,9 @@ def run_ui(sender, state, clip):
                     continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_s:
                     send_file_dialog(sender, state)
+                    continue
+                if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_d:
+                    browse_remote(sender, state)
                     continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_i:
                     state.show_stats = not state.show_stats
@@ -365,7 +586,7 @@ def run_client(args):
     clip.start()
 
     state = RemoteState()
-    t = threading.Thread(target=reader_thread, args=(sock, chan, state, clip), daemon=True)
+    t = threading.Thread(target=reader_thread, args=(sock, chan, state, clip, sender), daemon=True)
     t.start()
     try:
         run_ui(sender, state, clip)

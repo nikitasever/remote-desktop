@@ -252,6 +252,69 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
     pending_monitor = {"v": None}
     incoming_file = {"f": None, "name": None}
 
+    def _safe_resolve(requested_path):
+        """Resolve a requested path, preventing directory traversal.
+        Returns the real absolute path or None if unsafe."""
+        try:
+            # Normalize and resolve to absolute
+            resolved = os.path.realpath(os.path.abspath(requested_path))
+            # Basic sanity: must exist
+            if not os.path.exists(resolved):
+                return None
+            return resolved
+        except (ValueError, OSError):
+            return None
+
+    def _list_directory(path):
+        """List directory contents safely. Returns (resolved_path, entries) or (None, error_str)."""
+        if not path:
+            # Default: user's home directory
+            path = os.path.expanduser("~")
+        resolved = _safe_resolve(path)
+        if resolved is None or not os.path.isdir(resolved):
+            return None, "directory not found or not accessible"
+        entries = []
+        try:
+            for name in sorted(os.listdir(resolved)):
+                full = os.path.join(resolved, name)
+                try:
+                    st = os.stat(full)
+                    entries.append({
+                        "name": name,
+                        "size": st.st_size if not os.path.isdir(full) else 0,
+                        "is_dir": os.path.isdir(full),
+                    })
+                except OSError:
+                    continue  # skip inaccessible entries
+        except OSError as e:
+            return None, str(e)
+        return resolved, entries
+
+    def _send_file_to_client(path):
+        """Send a file from host to client in a background thread."""
+        def worker():
+            try:
+                resolved = _safe_resolve(path)
+                if resolved is None or not os.path.isfile(resolved):
+                    LOG(f"[host] запрос файла отклонён: {path}")
+                    return
+                size = os.path.getsize(resolved)
+                name = os.path.basename(resolved)
+                sender.send_json(common.MSG_HOST_FILE_META, {"name": name, "size": size})
+                sent = 0
+                with open(resolved, "rb") as f:
+                    while alive["v"]:
+                        chunk = f.read(256 * 1024)
+                        if not chunk:
+                            break
+                        sender.send(common.MSG_HOST_FILE_CHUNK, chunk)
+                        sent += len(chunk)
+                sender.send(common.MSG_HOST_FILE_END)
+                LOG(f"[host] отправлен файл клиенту: {name} ({sent} байт)")
+            except (ConnectionError, socket.error, OSError) as e:
+                LOG(f"[host] ошибка отправки файла: {e}")
+        threading.Thread(target=worker, daemon=True).start()
+
     # Приём команд — в отдельном потоке (блокирующее чтение, без частичных кадров).
     def recv_loop():
         try:
@@ -281,6 +344,19 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                         incoming_file["f"].close()
                         LOG(f"[host] файл сохранён: {incoming_file['name']}")
                         incoming_file["f"] = None
+                elif mt == common.MSG_DIR_LIST_REQ:
+                    req = common.parse_json(body)
+                    req_path = req.get("path", "")
+                    resolved, result = _list_directory(req_path)
+                    if resolved is not None:
+                        sender.send_json(common.MSG_DIR_LIST_RESP,
+                                         {"path": resolved, "entries": result})
+                    else:
+                        sender.send_json(common.MSG_DIR_LIST_RESP,
+                                         {"path": req_path, "entries": [], "error": result})
+                elif mt == common.MSG_FILE_PULL_REQ:
+                    req = common.parse_json(body)
+                    _send_file_to_client(req.get("path", ""))
         except (ConnectionError, socket.error):
             pass
         finally:

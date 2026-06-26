@@ -37,6 +37,14 @@ MSG_PONG        = 0x0B   # host -> client: эхо тела PING (для заме
 MSG_VIDEO_INFO  = 0x0C   # host -> client: JSON {"codec","w","h","fps"} — старт видео-потока
 MSG_VIDEO       = 0x0D   # host -> client: [1 байт keyframe] + H.264-пакет
 
+# --- Двусторонняя передача файлов и удалённый браузер ---
+MSG_FILE_PULL_REQ  = 0x10  # client -> host: JSON {"path": "..."} — запрос файла с host'а
+MSG_HOST_FILE_META = 0x11  # host -> client: JSON {"name","size"} — мета для обратного файла
+MSG_HOST_FILE_CHUNK= 0x12  # host -> client: бинарный кусок файла
+MSG_HOST_FILE_END  = 0x13  # host -> client: конец передачи файла
+MSG_DIR_LIST_REQ   = 0x14  # client -> host: JSON {"path": "..."} — запрос содержимого каталога
+MSG_DIR_LIST_RESP  = 0x15  # host -> client: JSON {"path","entries":[{"name","size","is_dir"},...]}
+
 # Соль фиксированная — пароль общий секрет, обмена солью нет.
 # Безопасность держится на длине/случайности пароля.
 _SALT = b"rdp-py-static-salt-v1"

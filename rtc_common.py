@@ -82,5 +82,20 @@ def send_msg(s, obj):
     s.sendall((json.dumps(obj) + "\n").encode("utf-8"))
 
 
+def _read_line(sock, max_len=65536):
+    """Читает строку до \\n — увеличенный лимит для SDP (audio+video > 4 KiB)."""
+    buf = bytearray()
+    while True:
+        ch = sock.recv(1)
+        if not ch:
+            raise ConnectionError("соединение закрыто до завершения строки")
+        if ch == b"\n":
+            break
+        buf.extend(ch)
+        if len(buf) > max_len:
+            raise ConnectionError("слишком длинная строка")
+    return buf.decode("utf-8")
+
+
 def recv_msg(s):
-    return json.loads(common.relay_read_line(s))
+    return json.loads(_read_line(s))

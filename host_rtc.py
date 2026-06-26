@@ -24,6 +24,7 @@ from aiortc.mediastreams import VideoStreamTrack
 
 import rtc_common
 import host as host_mod
+import audio as audio_mod
 
 LOG = print
 
@@ -82,6 +83,14 @@ async def run(args, stop_event=None):
 
     pc = RTCPeerConnection(_parse_ice(args))
     pc.addTrack(ScreenTrack(streamer, args.fps))
+
+    audio_track = audio_mod.LoopbackAudioTrack()
+    if audio_track.available:
+        pc.addTrack(audio_track)
+        LOG("[host-rtc] аудио-трек добавлен (WASAPI loopback)")
+    else:
+        LOG("[host-rtc] аудио недоступно — только видео")
+
     channel = pc.createDataChannel("control")
 
     @channel.on("message")
@@ -135,6 +144,7 @@ async def run(args, stop_event=None):
         except Exception:
             pass
         await pc.close()
+        audio_track.stop()
         streamer.close()
         LOG("[host-rtc] завершено")
 

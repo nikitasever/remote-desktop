@@ -722,7 +722,7 @@ def _run_direct(args, key, params, stop_event):
 def run_host(args, stop_event=None):
     """Цикл хоста. Вызывается из CLI и из GUI."""
     # Генерируем / загружаем уникальный ID хоста
-    BUILD = "2026-06-26-v5"
+    BUILD = "2026-06-27-v6"
     host_id = get_or_create_host_id()
     LOG(f"[host] RemoteDesktop build {BUILD}")
     LOG(f"[host] Ваш ID: {format_host_id(host_id)}")

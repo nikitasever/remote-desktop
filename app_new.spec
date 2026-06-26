@@ -28,7 +28,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='app',
+    name='app_new',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -206,6 +206,7 @@ class ScreenStreamer:
         self.quality = int(quality)
         self.codec = codec
         self._dx = None          # активная dxcam-камера (или None -> mss)
+        self._init_tid = threading.get_ident()   # поток, создавший mss
         self.set_monitor(index)
 
     def _open_dxcam(self, index):
@@ -244,10 +245,29 @@ class ScreenStreamer:
         LOG(f"[host] захват: {'dxcam (DXGI)' if self._dx else 'mss'} "
             f"монитор {self.index}/{self.count} {self.real_w}x{self.real_h}")
 
+    def _ensure_mss(self):
+        """Re-create mss if called from a different thread (GDI thread-affinity)."""
+        tid = threading.get_ident()
+        if tid != self._init_tid:
+            self.sct = mss_module.MSS()
+            self.mon = self.sct.monitors[self.index]
+            self._init_tid = tid
+
+    def _mss_grab(self):
+        """Grab via mss with thread-safety: re-create handle if needed."""
+        self._ensure_mss()
+        raw = self.sct.grab(self.mon)
+        return np.frombuffer(raw.rgb, dtype=np.uint8).reshape(
+            raw.height, raw.width, 3)
+
     def capture(self):
         """Кадр (numpy RGB) в потоковом размере, либо None если экран не менялся."""
         if self._dx is not None:
-            arr = self._dx.grab()        # None, если кадр не изменился (DXGI сам так умеет)
+            try:
+                arr = self._dx.grab()    # None, если кадр не изменился (DXGI)
+            except Exception as e:
+                LOG(f"[host] dxcam.grab() ошибка: {e}")
+                arr = None
             if arr is None:
                 # dxcam отдаёт ТОЛЬКО изменившиеся кадры. На статичном экране
                 # grab() вечно None — без этого клиент не получит ни одного кадра
@@ -257,9 +277,11 @@ class ScreenStreamer:
                 #     (нужно для подключения нового клиента и для keyframe).
                 now = time.time()
                 if self._last_arr is None:
-                    raw = self.sct.grab(self.mon)
-                    arr = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(
-                        raw.height, raw.width, 3)
+                    try:
+                        arr = self._mss_grab()
+                    except Exception as e:
+                        LOG(f"[host] mss фолбэк ошибка (первый кадр): {e}")
+                        return None
                 elif now - self._last_emit >= 0.5:
                     arr = self._last_arr
                 else:
@@ -267,8 +289,7 @@ class ScreenStreamer:
             self._last_arr = arr
             self._last_emit = time.time()
         else:
-            raw = self.sct.grab(self.mon)
-            arr = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)
+            arr = self._mss_grab()
             # быстрый детект статики по прорежённому кадру (каждый 4-й пиксель)
             fh = hash(arr[::4, ::4].tobytes())
             if fh == self._last_full:
@@ -498,9 +519,32 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
             f"~{enc.bitrate // 1000} кбит/с")
         return enc
 
+    def _send_initial_frame():
+        """Push a guaranteed first frame via mss so the client sees something
+        immediately, even if dxcam never fires (static screen on some GPUs)."""
+        try:
+            arr = streamer._mss_grab()
+            if streamer.scale != 1.0:
+                img = Image.fromarray(arr).resize((streamer.w, streamer.h), Image.BILINEAR)
+                arr = np.asarray(img)
+            if use_video and encoder:
+                encoder.force_keyframe()
+                for data, is_key in encoder.encode(arr):
+                    sender.send(common.MSG_VIDEO, bytes([1 if is_key else 0]) + data)
+            else:
+                tiles = streamer.dirty_tiles(arr)
+                if tiles:
+                    sender.send(common.MSG_TILES, pack_tiles(tiles))
+            streamer._last_arr = arr
+            streamer._last_emit = time.time()
+            LOG("[host] начальный кадр отправлен")
+        except Exception as e:
+            LOG(f"[host] ошибка отправки начального кадра: {e}")
+
     try:
         if use_video:
             encoder = _new_encoder()
+        _send_initial_frame()
         while alive["v"]:
             t0 = time.time()
             if pending_monitor["v"] is not None:
@@ -513,15 +557,24 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                     if encoder:
                         encoder.close()
                     encoder = _new_encoder()   # размер мог измениться -> новый энкодер
-            frame = streamer.capture()
+            try:
+                frame = streamer.capture()
+            except Exception as e:
+                LOG(f"[host] ошибка захвата: {e}")
+                frame = None
             if frame is not None:
-                if use_video:
-                    for data, is_key in encoder.encode(frame):
-                        sender.send(common.MSG_VIDEO, bytes([1 if is_key else 0]) + data)
-                else:
-                    tiles = streamer.dirty_tiles(frame)
-                    if tiles:
-                        sender.send(common.MSG_TILES, pack_tiles(tiles))
+                try:
+                    if use_video:
+                        for data, is_key in encoder.encode(frame):
+                            sender.send(common.MSG_VIDEO, bytes([1 if is_key else 0]) + data)
+                    else:
+                        tiles = streamer.dirty_tiles(frame)
+                        if tiles:
+                            sender.send(common.MSG_TILES, pack_tiles(tiles))
+                except (ConnectionError, socket.error):
+                    raise
+                except Exception as e:
+                    LOG(f"[host] ошибка кодирования/отправки: {e}")
             dt = time.time() - t0
             if dt < frame_interval:
                 time.sleep(frame_interval - dt)
@@ -643,7 +696,7 @@ def _run_direct(args, key, params, stop_event):
 def run_host(args, stop_event=None):
     """Цикл хоста. Вызывается из CLI и из GUI."""
     # Генерируем / загружаем уникальный ID хоста
-    BUILD = "2026-06-26-v3"
+    BUILD = "2026-06-26-v4"
     host_id = get_or_create_host_id()
     LOG(f"[host] RemoteDesktop build {BUILD}")
     LOG(f"[host] Ваш ID: {format_host_id(host_id)}")

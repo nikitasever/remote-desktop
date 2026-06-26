@@ -174,7 +174,7 @@ def relay_register_id(sock: socket.socket, unique_id: str) -> str:
         if not ch:
             raise ConnectionError("Соединение закрыто при ожидании ответа REGISTER")
         resp += ch
-    return resp.decode().strip()  # "OK" or error
+    return resp.decode().strip()
 
 
 def relay_connect_id(sock: socket.socket, unique_id: str) -> str:
@@ -186,7 +186,7 @@ def relay_connect_id(sock: socket.socket, unique_id: str) -> str:
         if not ch:
             raise ConnectionError("Соединение закрыто при ожидании ответа CONNECT")
         resp += ch
-    return resp.decode().strip()  # "OK" or "ERROR not_found"
+    return resp.decode().strip()
 
 
 def relay_read_line(sock: socket.socket) -> str:

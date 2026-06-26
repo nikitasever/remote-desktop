@@ -15,7 +15,9 @@ import argparse
 import ctypes
 import ctypes.wintypes
 import io
+import json
 import os
+import random
 import socket
 import threading
 import time
@@ -83,6 +85,35 @@ CODEC = "auto"        # формат плиток: "auto" | "jpeg" | "png"
 
 # Логгер можно переопределить из GUI (host.LOG = my_func)
 LOG = print
+
+# ---- Уникальный ID хоста (9-значный, сохраняется в %APPDATA%) ----
+
+HOST_CONFIG_DIR = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), "RemoteDesktop"
+)
+HOST_ID_FILE = os.path.join(HOST_CONFIG_DIR, "host_id.json")
+
+
+def get_or_create_host_id() -> str:
+    """Return persistent 9-digit host ID. Generate on first run."""
+    try:
+        with open(HOST_ID_FILE, "r") as f:
+            data = json.load(f)
+            host_id = data["id"]
+            if isinstance(host_id, str) and len(host_id) == 9 and host_id.isdigit():
+                return host_id
+    except (FileNotFoundError, KeyError, json.JSONDecodeError, ValueError):
+        pass
+    new_id = str(random.randint(100_000_000, 999_999_999))
+    os.makedirs(HOST_CONFIG_DIR, exist_ok=True)
+    with open(HOST_ID_FILE, "w") as f:
+        json.dump({"id": new_id}, f)
+    return new_id
+
+
+def format_host_id(host_id: str) -> str:
+    """Format 9-digit ID with spaces for readability: '847291035' -> '847 291 035'."""
+    return f"{host_id[:3]} {host_id[3:6]} {host_id[6:]}"
 
 
 # ---- Карта спец-клавиш: имя (от клиента) -> объект pynput ----
@@ -487,12 +518,26 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
 def make_socket(args):
     """Только relay-режим: подключение к relay и ожидание клиента.
     Direct-режим обслуживается отдельно в _run_direct (нужен преемптивный
-    accept-цикл, чтобы новый клиент вытеснял зависшую сессию)."""
+    accept-цикл, чтобы новый клиент вытеснял зависшую сессию).
+
+    Поддерживает два протокола:
+    - Новый (unique_id): REGISTER <9_digit_id> — relay отвечает OK
+    - Старый (id/комната): JSON-регистрация с ролью host
+    """
     host, port = args.relay.rsplit(":", 1)
     s = socket.create_connection((host, int(port)))
     common.enable_keepalive(s)
-    common.relay_register(s, "host", args.id)
-    LOG(f"[host] зарегистрирован на relay {args.relay}, комната '{args.id}', жду клиента...")
+
+    unique_id = getattr(args, "unique_id", None)
+    if unique_id:
+        resp = common.relay_register_id(s, unique_id)
+        if resp.startswith("ERROR"):
+            raise ConnectionError(f"Relay отклонил регистрацию: {resp}")
+        LOG(f"[host] зарегистрирован на relay {args.relay}, ID {format_host_id(unique_id)}, жду клиента...")
+    else:
+        common.relay_register(s, "host", args.id)
+        LOG(f"[host] зарегистрирован на relay {args.relay}, комната '{args.id}', жду клиента...")
+
     # Relay пришлёт строку, когда клиент подключится.
     line = common.relay_read_line(s)
     LOG(f"[host] relay: {line}")
@@ -578,6 +623,14 @@ def _run_direct(args, key, params, stop_event):
 
 def run_host(args, stop_event=None):
     """Цикл хоста. Вызывается из CLI и из GUI."""
+    # Генерируем / загружаем уникальный ID хоста
+    host_id = get_or_create_host_id()
+    LOG(f"[host] Ваш ID: {format_host_id(host_id)}")
+
+    # Если unique_id ещё не задан извне (GUI), ставим сгенерированный
+    if not getattr(args, "unique_id", None):
+        args.unique_id = host_id
+
     key = common.derive_key(args.password)
     params = dict(
         quality=getattr(args, "quality", JPEG_QUALITY),

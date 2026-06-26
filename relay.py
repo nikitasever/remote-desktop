@@ -3,6 +3,12 @@ RELAY — запускается на сервере с публичным IP (V
 Сводит host и client по одинаковому ID комнаты и слепо пересылает байты
 между ними. Пароль relay НЕ знает — поток зашифрован end-to-end.
 
+Поддерживает два протокола:
+  1. Старый (JSON, обратная совместимость): {"role":"host","session":"..."}\n
+  2. Новый (ID-based, как AnyDesk):
+       Host:   REGISTER <9-digit-id>\n  -> OK\n
+       Client: CONNECT <9-digit-id>\n  -> OK\n | ERROR not_found\n
+
 Запуск:   python relay.py --port 5800
 
 На VPS не забудьте открыть порт в фаерволе/security group.
@@ -14,8 +20,13 @@ import json
 import socket
 import threading
 
+# ---- Old room-based protocol ----
 rooms = {}            # session -> {"host": sock, "client": sock}
 rooms_lock = threading.Lock()
+
+# ---- New ID-based registry ----
+registry = {}         # id_str -> {"sock": socket, "event": Event, "client": socket|None}
+registry_lock = threading.Lock()
 
 
 def read_line(sock):
@@ -49,21 +60,137 @@ def pipe(src, dst):
                 pass
 
 
-def handle(sock, addr):
+def enable_keepalive(sock):
+    """Включает TCP keepalive на сокете."""
     try:
-        reg = json.loads(read_line(sock))
-        role, session = reg["role"], reg["session"]
-    except Exception as e:
-        print(f"[relay] {addr}: ошибка регистрации: {e}")
-        sock.close()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
         return
+    if hasattr(socket, "SIO_KEEPALIVE_VALS"):       # Windows
+        try:
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
+        except OSError:
+            pass
+    else:                                            # Linux/*nix
+        for opt, val in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 3), ("TCP_KEEPCNT", 3)):
+            o = getattr(socket, opt, None)
+            if o is not None:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, o, val)
+                except OSError:
+                    pass
 
+
+def start_pipe(host_s, client_s, cleanup_cb=None):
+    """Запускает двунаправленный пайп между двумя сокетами.
+    Блокирует текущий поток до завершения. cleanup_cb вызывается после."""
+    for s in (host_s, client_s):
+        enable_keepalive(s)
+
+    t1 = threading.Thread(target=pipe, args=(host_s, client_s), daemon=True)
+    t2 = threading.Thread(target=pipe, args=(client_s, host_s), daemon=True)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    if cleanup_cb:
+        cleanup_cb()
+
+
+# ---- New ID-based protocol handlers ----
+
+def handle_register(sock, addr, unique_id):
+    """Host: REGISTER <id> — регистрирует хост и ждёт клиентов."""
+    with registry_lock:
+        old_entry = registry.get(unique_id)
+        if old_entry is not None:
+            # Вытесняем старый хост
+            print(f"[relay] ID '{unique_id}': preempting old host")
+            try:
+                old_entry["sock"].close()
+            except OSError:
+                pass
+            old_entry["event"].set()  # разбудить старый поток, чтобы он завершился
+
+        entry = {"sock": sock, "event": threading.Event(), "client": None}
+        registry[unique_id] = entry
+
+    sock.sendall(b"OK\n")
+    print(f"[relay] {addr} REGISTER '{unique_id}' -> OK")
+
+    try:
+        while True:
+            # Ждём, пока клиент подключится
+            entry["event"].wait()
+            entry["event"].clear()
+
+            # Проверяем, не вытеснили ли нас
+            with registry_lock:
+                current = registry.get(unique_id)
+                if current is not entry:
+                    print(f"[relay] {addr} ID '{unique_id}': preempted, exiting")
+                    return
+
+            client_sock = entry["client"]
+            if client_sock is None:
+                continue
+
+            print(f"[relay] ID '{unique_id}' paired, piping traffic")
+
+            def cleanup():
+                entry["client"] = None
+                print(f"[relay] ID '{unique_id}' client disconnected, host waiting")
+
+            start_pipe(sock, client_sock, cleanup_cb=cleanup)
+
+            # После отключения клиента проверяем, не вытеснили ли нас
+            with registry_lock:
+                current = registry.get(unique_id)
+                if current is not entry:
+                    return
+                # Хост жив — ждём нового клиента (цикл продолжается)
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        with registry_lock:
+            current = registry.get(unique_id)
+            if current is entry:
+                del registry[unique_id]
+                print(f"[relay] ID '{unique_id}' host disconnected, removed from registry")
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def handle_connect(sock, addr, unique_id):
+    """Client: CONNECT <id> — подключается к зарегистрированному хосту."""
+    with registry_lock:
+        entry = registry.get(unique_id)
+        if entry is None:
+            sock.sendall(b"ERROR not_found\n")
+            print(f"[relay] {addr} CONNECT '{unique_id}' -> ERROR not_found")
+            sock.close()
+            return
+
+        entry["client"] = sock
+
+    sock.sendall(b"OK\n")
+    print(f"[relay] {addr} CONNECT '{unique_id}' -> OK")
+
+    # Разбудить хост-поток, чтобы он запустил пайп
+    entry["event"].set()
+
+    # Клиентский поток завершается здесь — пайп обслуживается хост-потоком
+
+
+# ---- Old room-based protocol handler ----
+
+def handle_room(sock, addr, role, session):
+    """Старый протокол: JSON-регистрация по роли и комнате."""
     with rooms_lock:
         room = rooms.setdefault(session, {})
         old = room.get(role)
         if old is not None:
-            # старое (возможно мёртвое) подключение этой роли — вытесняем его,
-            # чтобы повторный вход после обрыва не упирался в "роль занята".
             print(f"[relay] комната '{session}': роль {role} переподключается — закрываю старое")
             try:
                 old.close()
@@ -78,47 +205,56 @@ def handle(sock, addr):
     if not ready:
         return  # ждём вторую сторону; её поток поднимет пайпы
 
-    # Уведомим обе стороны, что пара готова (строкой с \n — до шифрованного потока).
+    # Уведомим обе стороны
     try:
         host_s.sendall(b'{"event":"paired"}\n')
         client_s.sendall(b'{"event":"paired"}\n')
     except OSError:
         pass
 
-    # keepalive: если одна сторона тихо исчезла (обрыв, сон ПК), пайп
-    # отвалится за ~20с и комната освободится, а не зависнет.
-    for s in (host_s, client_s):
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        except OSError:
-            continue
-        if hasattr(socket, "SIO_KEEPALIVE_VALS"):       # Windows
-            try:
-                s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
-            except OSError:
-                pass
-        else:                                            # Linux/*nix (сервер relay)
-            for opt, val in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 3), ("TCP_KEEPCNT", 3)):
-                o = getattr(socket, opt, None)
-                if o is not None:
-                    try:
-                        s.setsockopt(socket.IPPROTO_TCP, o, val)
-                    except OSError:
-                        pass
-
     print(f"[relay] комната '{session}' соединена, пересылаю трафик")
-    t1 = threading.Thread(target=pipe, args=(host_s, client_s), daemon=True)
-    t2 = threading.Thread(target=pipe, args=(client_s, host_s), daemon=True)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
 
-    with rooms_lock:
-        # удаляем комнату, только если в ней всё ещё наша пара
-        # (иначе могли уже переподключиться новые сокеты)
-        cur = rooms.get(session)
-        if cur and cur.get("host") is host_s and cur.get("client") is client_s:
-            rooms.pop(session, None)
-            print(f"[relay] комната '{session}' закрыта")
+    def cleanup():
+        with rooms_lock:
+            cur = rooms.get(session)
+            if cur and cur.get("host") is host_s and cur.get("client") is client_s:
+                rooms.pop(session, None)
+                print(f"[relay] комната '{session}' закрыта")
+
+    start_pipe(host_s, client_s, cleanup_cb=cleanup)
+
+
+# ---- Dispatcher ----
+
+def handle(sock, addr):
+    try:
+        line = read_line(sock)
+    except Exception as e:
+        print(f"[relay] {addr}: ошибка чтения первой строки: {e}")
+        sock.close()
+        return
+
+    # New protocol: REGISTER <id> or CONNECT <id>
+    if line.startswith("REGISTER "):
+        unique_id = line[len("REGISTER "):]
+        handle_register(sock, addr, unique_id)
+        return
+
+    if line.startswith("CONNECT "):
+        unique_id = line[len("CONNECT "):]
+        handle_connect(sock, addr, unique_id)
+        return
+
+    # Old protocol: JSON {"role": ..., "session": ...}
+    try:
+        reg = json.loads(line)
+        role, session = reg["role"], reg["session"]
+    except Exception as e:
+        print(f"[relay] {addr}: ошибка регистрации: {e}")
+        sock.close()
+        return
+
+    handle_room(sock, addr, role, session)
 
 
 def main():

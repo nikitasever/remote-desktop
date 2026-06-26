@@ -423,17 +423,96 @@ def ping_loop(sender, state):
         time.sleep(1.0)
 
 
+def _draw_rounded_rect(surface, color, rect, radius, alpha=255):
+    """Draw a filled rounded rectangle with optional alpha transparency."""
+    x, y, w, h = rect
+    if alpha < 255:
+        tmp = pygame.Surface((w, h), pygame.SRCALPHA)
+        c = (*color[:3], alpha)
+        pygame.draw.rect(tmp, c, (0, 0, w, h), border_radius=radius)
+        surface.blit(tmp, (x, y))
+    else:
+        pygame.draw.rect(surface, color, rect, border_radius=radius)
+
+
+class _ToolbarButton:
+    """A single toolbar button with icon text, label, hover state."""
+    def __init__(self, icon, label, action):
+        self.icon = icon
+        self.label = label
+        self.action = action
+        self.rect = pygame.Rect(0, 0, 0, 0)
+        self.hovered = False
+
+
 def run_ui(sender, state, clip):
     pygame.init()
-    pygame.display.set_caption("Remote Desktop — подключение...")
+    pygame.display.set_caption("Remote Desktop")
     win = pygame.display.set_mode((960, 600), pygame.RESIZABLE)
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont("Consolas", 16)
+
+    # Fonts
+    try:
+        font_ui = pygame.font.SysFont("Segoe UI", 14)
+        font_icon = pygame.font.SysFont("Segoe UI Symbol,Segoe UI Emoji,Segoe UI", 16)
+    except Exception:
+        font_ui = pygame.font.SysFont("Consolas", 14)
+        font_icon = font_ui
+    font_mono = pygame.font.SysFont("Consolas", 13)
+    font_tooltip = pygame.font.SysFont("Segoe UI", 12)
+
+    # Colors
+    COL_TOOLBAR_BG = (26, 26, 46)       # #1a1a2e
+    COL_ACCENT = (0, 120, 212)          # #0078d4
+    COL_HOVER = (42, 42, 78)            # #2a2a4e
+    COL_TEXT = (255, 255, 255)
+    COL_TEXT_DIM = (180, 180, 200)
+    COL_GREEN = (0, 200, 83)
+    COL_YELLOW = (255, 193, 7)
+    COL_RED = (244, 67, 54)
+
+    TOOLBAR_H = 40
+    BUTTON_H = 32
+    TOOLBAR_ALPHA = 200
+    TOOLBAR_TRIGGER_ZONE = 5        # px from top to trigger toolbar
+    TOOLBAR_AUTOHIDE_DELAY = 2.0    # seconds
+
+    # Toolbar buttons — defined once, actions bound via lambdas
+    toolbar_buttons = []
+
+    def _action_monitor():
+        with state.lock:
+            nxt = state.index % max(1, state.monitors) + 1
+        sender.send_json(common.MSG_SET_MONITOR, {"index": nxt})
+
+    def _action_send():
+        send_file_dialog(sender, state)
+
+    def _action_browse():
+        browse_remote(sender, state)
+
+    def _action_stats():
+        state.show_stats = not state.show_stats
+
+    def _action_disconnect():
+        state.alive = False
+
+    toolbar_buttons.append(_ToolbarButton("M", "Monitors", _action_monitor))
+    toolbar_buttons.append(_ToolbarButton("S", "Send File", _action_send))
+    toolbar_buttons.append(_ToolbarButton("D", "Browse Remote", _action_browse))
+    toolbar_buttons.append(_ToolbarButton("I", "Stats", _action_stats))
+    toolbar_buttons.append(_ToolbarButton("X", "Disconnect", _action_disconnect))
+
+    # Toolbar state
+    toolbar_visible = False
+    toolbar_alpha = 0          # 0..255 for fade animation
+    toolbar_last_hover = 0.0   # timestamp of last hover in toolbar zone
+    toolbar_hovered = False    # mouse is in toolbar area right now
 
     threading.Thread(target=ping_loop, args=(sender, state), daemon=True).start()
     last_stat = time.time()
 
-    # Ждём информацию об экране
+    # Wait for screen info
     while state.alive and state.surface is None:
         clock.tick(30)
     if not state.alive:
@@ -450,7 +529,7 @@ def run_ui(sender, state, clip):
         return (max(0.0, min(1.0, pos[0] / ww)), max(0.0, min(1.0, pos[1] / wh)))
 
     BTN = {1: "left", 2: "middle", 3: "right"}
-    held = {}   # pygame key -> ident: отслеживаем нажатые, чтобы слать и kup
+    held = {}   # pygame key -> ident
 
     def release_all():
         for ident in list(held.values()):
@@ -458,23 +537,60 @@ def run_ui(sender, state, clip):
         held.clear()
 
     while state.alive:
+        now = time.time()
+
+        # Clean window title (no hotkey list)
         if state.title_dirty:
             with state.lock:
                 state.title_dirty = False
-                cap = (f"Remote Desktop {state.w}x{state.h}  монитор {state.index}/{state.monitors}"
-                       f"   (Ctrl+Alt: Q-выход  M-монитор  S-отправить  D-обзор  I-статистика)")
+                cap = f"Remote Desktop — {state.w}×{state.h}"
             pygame.display.set_caption(cap)
 
+        # Track mouse for toolbar
+        mouse_pos = pygame.mouse.get_pos()
+        mouse_in_trigger = mouse_pos[1] <= TOOLBAR_TRIGGER_ZONE
+        mouse_in_toolbar = mouse_pos[1] <= TOOLBAR_H and toolbar_visible
+
+        if mouse_in_trigger or mouse_in_toolbar:
+            toolbar_last_hover = now
+            toolbar_hovered = True
+        else:
+            toolbar_hovered = False
+
+        # Toolbar visibility: show if recently hovered, auto-hide after delay
+        if toolbar_hovered or (now - toolbar_last_hover < TOOLBAR_AUTOHIDE_DELAY):
+            toolbar_visible = True
+            toolbar_alpha = min(toolbar_alpha + 30, TOOLBAR_ALPHA)
+        else:
+            toolbar_alpha = max(toolbar_alpha - 15, 0)
+            if toolbar_alpha == 0:
+                toolbar_visible = False
+
+        # Check button hover states
+        for btn in toolbar_buttons:
+            btn.hovered = toolbar_visible and btn.rect.collidepoint(mouse_pos)
+
+        # Event handling
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 state.alive = False
             elif event.type == pygame.VIDEORESIZE:
                 win = pygame.display.set_mode(event.size, pygame.RESIZABLE)
             elif event.type == pygame.MOUSEMOTION:
-                x, y = to_norm(event.pos)
-                send_input({"k": "move", "x": x, "y": y})
+                # Don't forward mouse to remote when in toolbar area
+                if not (toolbar_visible and event.pos[1] <= TOOLBAR_H):
+                    x, y = to_norm(event.pos)
+                    send_input({"k": "move", "x": x, "y": y})
             elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
-                if event.button in (4, 5):  # колесо
+                # Toolbar button clicks
+                if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                        and toolbar_visible and event.pos[1] <= TOOLBAR_H):
+                    for btn in toolbar_buttons:
+                        if btn.rect.collidepoint(event.pos):
+                            btn.action()
+                            break
+                    continue
+                if event.button in (4, 5):  # scroll wheel
                     if event.type == pygame.MOUSEBUTTONDOWN:
                         send_input({"k": "scroll", "dx": 0, "dy": 1 if event.button == 4 else -1})
                 else:
@@ -488,9 +604,7 @@ def run_ui(sender, state, clip):
                     state.alive = False
                     break
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_m:
-                    with state.lock:
-                        nxt = state.index % max(1, state.monitors) + 1
-                    sender.send_json(common.MSG_SET_MONITOR, {"index": nxt})
+                    _action_monitor()
                     continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_s:
                     send_file_dialog(sender, state)
@@ -506,17 +620,16 @@ def run_ui(sender, state, clip):
                     if ident is not None:
                         held[event.key] = ident
                         send_input({"k": "kdown", **ident})
-                else:  # KEYUP — шлём release для ранее нажатой клавиши
+                else:  # KEYUP
                     ident = held.pop(event.key, None)
                     if ident is None and event.key in PG_SPECIAL:
                         ident = {"name": PG_SPECIAL[event.key]}
                     if ident is not None:
                         send_input({"k": "kup", **ident})
             elif event.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
-                release_all()   # окно потеряло фокус — отпускаем всё, чтобы не залипало
+                release_all()
 
-        # Пересчёт статистики раз в секунду
-        now = time.time()
+        # Stats recalculation (once per second)
         if now - last_stat >= 1.0:
             dt = now - last_stat
             with state.lock:
@@ -526,25 +639,118 @@ def run_ui(sender, state, clip):
                 state.recv_bytes = 0
             last_stat = now
 
-        # Рендер
+        # --- Render ---
         with state.lock:
             if state.surface is not None:
                 if state.surface.get_size() == win.get_size():
-                    win.blit(state.surface, (0, 0))          # 1:1 — без масштабирования
+                    win.blit(state.surface, (0, 0))
                 else:
                     win.blit(pygame.transform.smoothscale(state.surface, win.get_size()), (0, 0))
             show = state.show_stats
             fps, kbps, rtt = state.fps, state.kbps, state.rtt_ms
+            mon_index, mon_total = state.index, state.monitors
 
+        # --- HUD overlay (bottom-right) ---
         if show:
-            rtt_txt = f"{rtt:.0f} ms" if rtt is not None else "—"
-            line = f" FPS: {fps}   RTT: {rtt_txt}   {kbps} KB/s "
-            txt = font.render(line, True, (255, 255, 255))
-            bg = pygame.Surface((txt.get_width(), txt.get_height()))
-            bg.set_alpha(150)
-            bg.fill((0, 0, 0))
-            win.blit(bg, (6, 6))
-            win.blit(txt, (6, 6))
+            rtt_val = rtt if rtt is not None else 0
+            rtt_txt = f"{rtt:.0f}ms" if rtt is not None else "--"
+            # Quality dot color
+            if rtt is None or rtt > 150:
+                dot_col = COL_RED
+            elif rtt > 50:
+                dot_col = COL_YELLOW
+            else:
+                dot_col = COL_GREEN
+
+            hud_lines = [
+                f"FPS {fps}",
+                f"RTT {rtt_txt}",
+                f"{kbps} KB/s",
+            ]
+            line_h = 18
+            hud_w = 110
+            hud_h = line_h * len(hud_lines) + 12
+            ww, wh = win.get_size()
+            hud_x = ww - hud_w - 10
+            hud_y = wh - hud_h - 10
+
+            # Semi-transparent background
+            hud_bg = pygame.Surface((hud_w, hud_h), pygame.SRCALPHA)
+            pygame.draw.rect(hud_bg, (0, 0, 0, 140), (0, 0, hud_w, hud_h), border_radius=6)
+            win.blit(hud_bg, (hud_x, hud_y))
+
+            # Quality dot
+            pygame.draw.circle(win, dot_col, (hud_x + hud_w - 14, hud_y + 12), 5)
+
+            # Text lines
+            for i, line in enumerate(hud_lines):
+                txt = font_mono.render(line, True, COL_TEXT_DIM)
+                win.blit(txt, (hud_x + 8, hud_y + 6 + i * line_h))
+
+        # --- Toolbar (top, auto-hiding) ---
+        if toolbar_visible and toolbar_alpha > 0:
+            ww = win.get_size()[0]
+            tb_surf = pygame.Surface((ww, TOOLBAR_H), pygame.SRCALPHA)
+            pygame.draw.rect(tb_surf, (*COL_TOOLBAR_BG, toolbar_alpha),
+                             (0, 0, ww, TOOLBAR_H))
+
+            # Layout buttons centered horizontally
+            btn_pad = 6
+            btn_w_list = []
+            for btn in toolbar_buttons:
+                icon_w = font_icon.size(btn.icon)[0]
+                label_w = font_ui.size(btn.label)[0]
+                w = icon_w + label_w + 20
+                btn_w_list.append(max(w, 70))
+
+            # Monitor indicator width
+            mon_text = f"Monitor {mon_index}/{mon_total}"
+            mon_w = font_ui.size(mon_text)[0] + 16
+
+            total_w = sum(btn_w_list) + btn_pad * (len(toolbar_buttons) - 1) + mon_w + 20
+            start_x = (ww - total_w) // 2
+
+            # Draw monitor indicator on the left side of button group
+            mon_rect = pygame.Rect(start_x, (TOOLBAR_H - BUTTON_H) // 2, mon_w, BUTTON_H)
+            pygame.draw.rect(tb_surf, (*COL_ACCENT, min(toolbar_alpha, 180)),
+                             mon_rect, border_radius=4)
+            mon_txt = font_ui.render(mon_text, True, COL_TEXT)
+            tb_surf.blit(mon_txt, (mon_rect.x + (mon_w - mon_txt.get_width()) // 2,
+                                   mon_rect.y + (BUTTON_H - mon_txt.get_height()) // 2))
+
+            # Draw buttons
+            bx = start_x + mon_w + 20
+            for i, btn in enumerate(toolbar_buttons):
+                bw = btn_w_list[i]
+                by = (TOOLBAR_H - BUTTON_H) // 2
+                btn.rect = pygame.Rect(bx, by, bw, BUTTON_H)
+
+                # Hover highlight
+                if btn.hovered:
+                    pygame.draw.rect(tb_surf, (*COL_HOVER, min(toolbar_alpha, 220)),
+                                     btn.rect, border_radius=4)
+
+                # Icon + label
+                icon_surf = font_icon.render(btn.icon, True, COL_TEXT)
+                label_surf = font_ui.render(btn.label, True,
+                                            COL_TEXT if btn.hovered else COL_TEXT_DIM)
+                icon_y = by + (BUTTON_H - icon_surf.get_height()) // 2
+                label_y = by + (BUTTON_H - label_surf.get_height()) // 2
+                tb_surf.blit(icon_surf, (bx + 8, icon_y))
+                tb_surf.blit(label_surf, (bx + 8 + icon_surf.get_width() + 4, label_y))
+
+                # Disconnect button: red accent on hover
+                if btn.label == "Disconnect" and btn.hovered:
+                    pygame.draw.rect(tb_surf, (*COL_RED, 60),
+                                     btn.rect, border_radius=4)
+
+                bx += bw + btn_pad
+
+            # Bottom border accent line
+            pygame.draw.line(tb_surf, (*COL_ACCENT, toolbar_alpha),
+                             (0, TOOLBAR_H - 1), (ww, TOOLBAR_H - 1))
+
+            win.blit(tb_surf, (0, 0))
 
         pygame.display.flip()
         clock.tick(30)

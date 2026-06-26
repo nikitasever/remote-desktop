@@ -88,6 +88,7 @@ class RemoteState:
         self.recv_frames = 0     # счётчик пришедших кадров (MSG_TILES)
         self.recv_bytes = 0      # байт плиток за интервал
         self.rtt_ms = None       # последний замер RTT
+        self.rtt_time = 0.0      # время последнего PONG (для обнаружения stale RTT)
         self.fps = 0
         self.kbps = 0
         self.show_stats = True    # Ctrl+Alt+I — вкл/выкл
@@ -158,6 +159,7 @@ def reader_thread(sock, chan, state, clip, sender=None):
                 t0 = common.parse_json(body).get("t", 0)
                 with state.lock:
                     state.rtt_ms = (time.time() - t0) * 1000.0
+                    state.rtt_time = time.time()
             elif mt == common.MSG_CLIPBOARD:
                 clip.on_remote(common.parse_json(body).get("text", ""))
             elif mt == common.MSG_HOST_FILE_META:
@@ -588,6 +590,8 @@ def run_ui(sender, state, clip):
             sender.send_json(common.MSG_INPUT, ev)
         except (ConnectionError, socket.error):
             state.alive = False
+        except Exception as exc:
+            log.warning("send_input error: %s (event: %s)", exc, ev)
 
     def to_norm(pos):
         ww, wh = win.get_size()
@@ -595,11 +599,13 @@ def run_ui(sender, state, clip):
 
     BTN = {1: "left", 2: "middle", 3: "right"}
     held = {}   # pygame key -> ident
+    consumed_keys = set()  # keys consumed by local hotkeys — suppress their KEYUP
 
     def release_all():
         for ident in list(held.values()):
             send_input({"k": "kup", **ident})
         held.clear()
+        consumed_keys.clear()
 
     while state.alive:
         now = time.time()
@@ -673,24 +679,34 @@ def run_ui(sender, state, clip):
                 # Fullscreen: F11 toggles, Esc exits, Ctrl+Alt+F toggles
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
                     _toggle_fullscreen()
+                    consumed_keys.add(event.key)
                     continue
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and is_fullscreen:
                     _toggle_fullscreen()
+                    consumed_keys.add(event.key)
                     continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_f:
                     _toggle_fullscreen()
+                    consumed_keys.add(event.key)
                     continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_m:
                     _action_monitor()
+                    consumed_keys.add(event.key)
                     continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_s:
                     send_file_dialog(sender, state)
+                    consumed_keys.add(event.key)
                     continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_d:
                     browse_remote(sender, state)
+                    consumed_keys.add(event.key)
                     continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_i:
                     state.show_stats = not state.show_stats
+                    consumed_keys.add(event.key)
+                    continue
+                if event.type == pygame.KEYUP and event.key in consumed_keys:
+                    consumed_keys.discard(event.key)
                     continue
                 if event.type == pygame.KEYDOWN:
                     ident = key_ident(event, mods)
@@ -725,14 +741,19 @@ def run_ui(sender, state, clip):
                     win.blit(pygame.transform.smoothscale(state.surface, win.get_size()), (0, 0))
             show = state.show_stats
             fps, kbps, rtt = state.fps, state.kbps, state.rtt_ms
+            rtt_age = now - state.rtt_time if state.rtt_time else None
             mon_index, mon_total = state.index, state.monitors
 
         # --- HUD overlay (bottom-right) ---
         if show:
-            rtt_val = rtt if rtt is not None else 0
-            rtt_txt = f"{rtt:.0f}ms" if rtt is not None else "--"
+            # Mark RTT as stale if no PONG received for >5 seconds
+            rtt_stale = rtt_age is None or rtt_age > 5.0
+            if rtt_stale:
+                rtt_txt = "--"
+            else:
+                rtt_txt = f"{rtt:.0f}ms" if rtt is not None else "--"
             # Quality dot color
-            if rtt is None or rtt > 150:
+            if rtt_stale or rtt is None or rtt > 150:
                 dot_col = COL_RED
             elif rtt > 50:
                 dot_col = COL_YELLOW

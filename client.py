@@ -451,6 +451,27 @@ def run_ui(sender, state, clip):
     win = pygame.display.set_mode((960, 600), pygame.RESIZABLE)
     clock = pygame.time.Clock()
 
+    # Fullscreen state
+    is_fullscreen = False
+    windowed_size = (960, 600)  # remember windowed size for restore
+
+    def _toggle_fullscreen():
+        nonlocal win, is_fullscreen, windowed_size, toolbar_visible, toolbar_last_hover, toolbar_alpha
+        if is_fullscreen:
+            # Exit fullscreen — restore windowed mode
+            win = pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
+            is_fullscreen = False
+        else:
+            # Enter fullscreen — save current window size first
+            windowed_size = win.get_size()
+            win = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            is_fullscreen = True
+            # Flash toolbar briefly so user sees the UI
+            toolbar_visible = True
+            toolbar_alpha = TOOLBAR_ALPHA
+            toolbar_last_hover = time.time()
+        pygame.display.set_caption(f"Remote Desktop — {state.w}×{state.h}")
+
     # Fonts
     try:
         font_ui = pygame.font.SysFont("Segoe UI", 14)
@@ -497,10 +518,14 @@ def run_ui(sender, state, clip):
     def _action_disconnect():
         state.alive = False
 
+    def _action_fullscreen():
+        _toggle_fullscreen()
+
     toolbar_buttons.append(_ToolbarButton("M", "Monitors", _action_monitor))
     toolbar_buttons.append(_ToolbarButton("S", "Send File", _action_send))
     toolbar_buttons.append(_ToolbarButton("D", "Browse Remote", _action_browse))
     toolbar_buttons.append(_ToolbarButton("I", "Stats", _action_stats))
+    toolbar_buttons.append(_ToolbarButton("F", "Fullscreen", _action_fullscreen))
     toolbar_buttons.append(_ToolbarButton("X", "Disconnect", _action_disconnect))
 
     # Toolbar state
@@ -575,7 +600,9 @@ def run_ui(sender, state, clip):
             if event.type == pygame.QUIT:
                 state.alive = False
             elif event.type == pygame.VIDEORESIZE:
-                win = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+                if not is_fullscreen:
+                    windowed_size = event.size
+                    win = pygame.display.set_mode(event.size, pygame.RESIZABLE)
             elif event.type == pygame.MOUSEMOTION:
                 # Don't forward mouse to remote when in toolbar area
                 if not (toolbar_visible and event.pos[1] <= TOOLBAR_H):
@@ -603,6 +630,16 @@ def run_ui(sender, state, clip):
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_q:
                     state.alive = False
                     break
+                # Fullscreen: F11 toggles, Esc exits, Ctrl+Alt+F toggles
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_F11:
+                    _toggle_fullscreen()
+                    continue
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and is_fullscreen:
+                    _toggle_fullscreen()
+                    continue
+                if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_f:
+                    _toggle_fullscreen()
+                    continue
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_m:
                     _action_monitor()
                     continue
@@ -686,6 +723,12 @@ def run_ui(sender, state, clip):
             for i, line in enumerate(hud_lines):
                 txt = font_mono.render(line, True, COL_TEXT_DIM)
                 win.blit(txt, (hud_x + 8, hud_y + 6 + i * line_h))
+
+        # Update fullscreen button label to reflect current state
+        for btn in toolbar_buttons:
+            if btn.action == _action_fullscreen:
+                btn.label = "Windowed" if is_fullscreen else "Fullscreen"
+                btn.icon = "W" if is_fullscreen else "F"
 
         # --- Toolbar (top, auto-hiding) ---
         if toolbar_visible and toolbar_alpha > 0:

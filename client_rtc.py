@@ -15,12 +15,13 @@ CLIENT через WebRTC (Фаза B) — экспериментальный т�
 import argparse
 import asyncio
 import json
+import os
 import threading
 import time
 
 import numpy as np
 import pygame
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc import RTCPeerConnection, RTCSessionDescription
 
 import rtc_common
 import client as client_mod
@@ -37,13 +38,19 @@ class State:
         self.connected = False
 
 
-def _ice_config(stun):
-    servers = [RTCIceServer(urls=[stun])] if stun else []
-    return RTCConfiguration(iceServers=servers)
+def _parse_ice(args):
+    """Build RTCConfiguration from CLI args / env vars."""
+    stun_urls = None
+    if args.stun is not None:
+        stun_urls = [u.strip() for u in args.stun.split(",") if u.strip()]
+    turn_url  = args.turn  or os.environ.get("RD_TURN_URL")
+    turn_user = args.turn_user or os.environ.get("RD_TURN_USER")
+    turn_pass = args.turn_pass or os.environ.get("RD_TURN_PASS")
+    return rtc_common.build_ice_config(stun_urls, turn_url, turn_user, turn_pass)
 
 
 async def amain(args, state):
-    pc = RTCPeerConnection(_ice_config(args.stun))
+    pc = RTCPeerConnection(_parse_ice(args))
 
     @pc.on("track")
     def on_track(track):
@@ -213,7 +220,12 @@ def main():
     ap.add_argument("--relay", required=True, help="Сигналинг (relay.py) vps:порт")
     ap.add_argument("--id", default="default", help="ID комнаты")
     ap.add_argument("--password", default="", help="Пока только гейт комнаты (PoC)")
-    ap.add_argument("--stun", default="", help="STUN/TURN URL")
+    ap.add_argument("--stun", default=None,
+                    help="STUN URL(s), через запятую. По умолчанию stun:stun.l.google.com:19302; "
+                         "передайте '' чтобы отключить")
+    ap.add_argument("--turn", default="", help="TURN URL, напр. turn:vps:3478 (или env RD_TURN_URL)")
+    ap.add_argument("--turn-user", default="", help="TURN username (или env RD_TURN_USER)")
+    ap.add_argument("--turn-pass", default="", help="TURN password (или env RD_TURN_PASS)")
     args = ap.parse_args()
 
     state = State()

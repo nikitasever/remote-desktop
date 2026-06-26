@@ -29,25 +29,69 @@ python client_rtc.py --relay 127.0.0.1:5800 --id myroom
 
 1. **relay.py на VPS** с публичным IP (он нужен только для обмена SDP, трафик
    идёт P2P). Открыть порт 5800.
-2. **STUN** (бесплатный) — для определения внешнего адреса при «обычном» NAT:
+2. **STUN** (бесплатный) — для определения внешнего адреса при «обычном» NAT.
+   По умолчанию используется `stun:stun.l.google.com:19302`, дополнительная
+   настройка не требуется:
    ```bash
-   python host_rtc.py   --relay VPS:5800 --id myroom --stun stun:stun.l.google.com:19302
-   python client_rtc.py --relay VPS:5800 --id myroom --stun stun:stun.l.google.com:19302
+   python host_rtc.py   --relay VPS:5800 --id myroom
+   python client_rtc.py --relay VPS:5800 --id myroom
+   ```
+   Можно указать свои серверы (через запятую) или отключить STUN:
+   ```bash
+   # Свои STUN серверы
+   python host_rtc.py --relay VPS:5800 --id myroom \
+       --stun "stun:stun1.l.google.com:19302,stun:stun2.l.google.com:19302"
+   # Отключить STUN (только host-кандидаты)
+   python host_rtc.py --relay VPS:5800 --id myroom --stun ""
    ```
 3. **TURN** — для симметричного NAT, когда P2P не строится (трафик пойдёт через
    TURN-сервер). Поднять coturn на VPS:
    ```
    # /etc/turnserver.conf
    listening-port=3478
+   tls-listening-port=5349
    fingerprint
    lt-cred-mech
    user=rd:СЕКРЕТ
    realm=ваш.домен
+   external-ip=ВНЕШНИЙ_IP
+   # Порты для relay (ограничить диапазон для firewall)
+   min-port=49152
+   max-port=65535
    ```
-   Затем указать клиенту/хосту:
-   `--stun turn:VPS:3478` (в aiortc TURN-URL передаётся тем же флагом; для
-   логина/пароля потребуется доработать `_ice_config` — добавить
-   `RTCIceServer(urls=[...], username=..., credential=...)`).
+   Запуск coturn: `turnserver -c /etc/turnserver.conf`
+
+   Указать TURN хосту и клиенту:
+   ```bash
+   python host_rtc.py --relay VPS:5800 --id myroom \
+       --turn turn:VPS:3478 --turn-user rd --turn-pass СЕКРЕТ
+
+   python client_rtc.py --relay VPS:5800 --id myroom \
+       --turn turn:VPS:3478 --turn-user rd --turn-pass СЕКРЕТ
+   ```
+   Или через переменные окружения (удобно для автоматизации):
+   ```bash
+   export RD_TURN_URL=turn:VPS:3478
+   export RD_TURN_USER=rd
+   export RD_TURN_PASS=СЕКРЕТ
+   python host_rtc.py --relay VPS:5800 --id myroom
+   ```
+
+### CLI-флаги ICE
+
+| Флаг           | Env-переменная | Описание |
+|----------------|----------------|----------|
+| `--stun`       | —              | STUN URL(s), через запятую. По умолчанию `stun:stun.l.google.com:19302`; `""` — отключить |
+| `--turn`       | `RD_TURN_URL`  | TURN URL, напр. `turn:vps:3478` |
+| `--turn-user`  | `RD_TURN_USER` | TURN username (long-term credentials) |
+| `--turn-pass`  | `RD_TURN_PASS` | TURN password |
+
+CLI-флаг имеет приоритет над переменной окружения.
+
+## Тесты
+
+- `smoke_test_rtc.py` — E2E тест WebRTC (relay + host + client, localhost). **2/2.**
+- `smoke_test_ice.py` — юнит-тесты ICE-конфигурации (build_ice_config).
 
 ## Известные ограничения PoC
 

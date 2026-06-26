@@ -453,7 +453,10 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
         threading.Thread(target=worker, daemon=True).start()
 
     # Приём команд — в отдельном потоке (блокирующее чтение, без частичных кадров).
+    _input_count = {"n": 0}
+
     def recv_loop():
+        LOG("[host] recv_loop: поток стартовал")
         try:
             while alive["v"]:
                 try:
@@ -465,9 +468,19 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                     continue
                 if mt == common.MSG_INPUT:
                     try:
-                        injector.handle(common.parse_json(body))
+                        ev = common.parse_json(body)
                     except Exception as e:
-                        LOG(f"[host] ошибка ввода в recv_loop: {e}")
+                        LOG(f"[host] ошибка parse_json INPUT: {e}, body={body!r:.200}")
+                        continue
+                    _input_count["n"] += 1
+                    cnt = _input_count["n"]
+                    if cnt <= 3 or cnt % 100 == 0:
+                        LOG(f"[host] INPUT #{cnt}: {ev.get('k')} "
+                            f"(x={ev.get('x','?')}, y={ev.get('y','?')})")
+                    try:
+                        injector.handle(ev)
+                    except Exception as e:
+                        LOG(f"[host] ошибка ввода в recv_loop: {e} | ev={ev}")
                     continue
                 elif mt == common.MSG_PING:
                     sender.send(common.MSG_PONG, body)  # отражаем как есть
@@ -504,8 +517,10 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                 elif mt == common.MSG_FILE_PULL_REQ:
                     req = common.parse_json(body)
                     _send_file_to_client(req.get("path", ""))
-        except (ConnectionError, socket.error):
-            pass
+                else:
+                    LOG(f"[host] recv_loop: неизвестный тип 0x{mt:02X}, {len(body)} байт")
+        except (ConnectionError, socket.error) as e:
+            LOG(f"[host] recv_loop: соединение потеряно: {e}")
         finally:
             alive["v"] = False
             if incoming_file["f"]:

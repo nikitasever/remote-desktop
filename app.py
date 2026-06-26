@@ -77,7 +77,7 @@ class LauncherUI:
     def __init__(self, root):
         self.root = root
         root.title("RemoteDesktop")
-        root.resizable(False, True)
+        root.resizable(True, True)
         root.minsize(480, 400)
         root.configure(fg_color=BG_DARK)
         cfg = load_config()
@@ -248,35 +248,26 @@ class LauncherUI:
         self.hint.pack(anchor="w", padx=4, pady=(0, 2))
 
     def _build_host_settings(self):
-        """Host-only settings: downloads dir, quality, fps, scale, codec, engine.
-
-        Wrapped in a CTkScrollableFrame so it scrolls when the window is too
-        short (e.g. on small displays).
-        """
-        # Outer wrapper — a plain frame used for pack/pack_forget visibility toggling.
+        """Host-only settings: downloads dir, quality, fps, scale, codec, engine."""
+        # Outer wrapper — used for pack/pack_forget visibility toggling.
         self.host_wrapper = ctk.CTkFrame(self.main_frame, fg_color="transparent",
                                          corner_radius=0)
-        self.host_wrapper.pack(fill="both", expand=True, padx=0, pady=0)
+        self.host_wrapper.pack(fill="x", padx=0, pady=0)
 
-        # Scrollable frame styled to look like the existing cards.
-        self.host_scroll = ctk.CTkScrollableFrame(
-            self.host_wrapper,
-            fg_color=BG_CARD,
-            scrollbar_button_color=BORDER,
-            scrollbar_button_hover_color=ACCENT,
-            corner_radius=12,
-            border_width=1,
-            border_color=BORDER,
-            label_text="Настройки хоста",
-            label_font=ctk.CTkFont(size=13, weight="bold"),
-            label_text_color=TEXT_PRIMARY,
-            label_fg_color=BG_CARD,
-            label_anchor="w",
-        )
-        self.host_scroll.pack(fill="both", expand=True, padx=24, pady=(8, 0))
+        # Card frame styled like the other sections.
+        self.host_card_outer = ctk.CTkFrame(self.host_wrapper, fg_color=BG_CARD,
+                                            corner_radius=12, border_width=1,
+                                            border_color=BORDER)
+        self.host_card_outer.pack(fill="x", padx=24, pady=(8, 0))
 
-        # Alias for the inner content area (replaces the old self.host_card).
-        self.host_card = self.host_scroll
+        # Section title
+        ctk.CTkLabel(self.host_card_outer, text="Настройки хоста",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=TEXT_PRIMARY).pack(anchor="w", padx=16, pady=(14, 0))
+
+        # Inner content area
+        self.host_card = ctk.CTkFrame(self.host_card_outer, fg_color="transparent")
+        self.host_card.pack(fill="x", padx=16, pady=(8, 14))
 
         # Downloads dir
         dl_row = ctk.CTkFrame(self.host_card, fg_color="transparent")
@@ -461,7 +452,7 @@ class LauncherUI:
         self.footer_frame.pack_forget()
 
         if is_host:
-            self.host_wrapper.pack(fill="both", expand=True, padx=0, pady=0)
+            self.host_wrapper.pack(fill="x", padx=0, pady=0)
 
         self.btn_frame.pack(fill="x", padx=24, pady=(12, 4))
         self.footer_frame.pack(fill="x", padx=24, pady=(4, 16))
@@ -659,7 +650,7 @@ def main():
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     root = ctk.CTk()
-    root.geometry("480x720")
+    root.geometry("500x850")
     LauncherUI(root)
     root.mainloop()
 

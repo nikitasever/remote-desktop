@@ -1,0 +1,11 @@
+# host.py и client.py. relay.py зависимостей НЕ требует (только stdlib).
+mss>=9.0.1
+numpy>=1.24
+Pillow>=10.0
+pynput>=1.7.6
+pygame>=2.5         # нужен только для client.py
+cryptography>=42.0
+pyperclip>=1.8     # синхронизация буфера обмена
+av>=12,<17         # H.264 кодек экрана; верх ограничен совместимостью с aiortc
+dxcam>=0.3         # GPU-захват экрана (DXGI) на host; фолбэк на mss
+aiortc>=1.14       # Фаза B: WebRTC-транспорт (UDP/DTLS-SRTP, NAT-traversal)

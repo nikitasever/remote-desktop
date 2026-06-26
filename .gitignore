@@ -1,0 +1,19 @@
+# Виртуальное окружение и кэш Python
+.venv/
+__pycache__/
+*.pyc
+
+# Сборки PyInstaller
+build/
+build_*/
+dist/
+dist_*/
+
+# Принятые файлы / временное
+RemoteDesktop_received/
+relay.py.bak-*
+
+# Секреты (на всякий случай — не должны попадать в репозиторий)
+*.key
+*.pem
+config.json

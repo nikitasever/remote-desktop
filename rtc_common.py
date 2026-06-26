@@ -12,9 +12,59 @@ ICE-кандидаты не «тричклим»: aiortc в setLocalDescription 
 """
 
 import json
+import os
 import socket
 
+from aiortc import RTCConfiguration, RTCIceServer
+
 import common
+
+# ── ICE configuration ────────────────────────────────────────────────
+
+DEFAULT_STUN = ["stun:stun.l.google.com:19302"]
+
+
+def build_ice_config(
+    stun_urls=None,
+    turn_url=None,
+    turn_user=None,
+    turn_pass=None,
+):
+    """Build an aiortc RTCConfiguration with STUN and optional TURN servers.
+
+    Parameters
+    ----------
+    stun_urls : list[str] | None
+        STUN server URLs (e.g. ``["stun:stun.l.google.com:19302"]``).
+        *None* (default) → use ``DEFAULT_STUN``.
+        Pass an empty list to disable STUN.
+    turn_url : str | None
+        TURN server URL, e.g. ``"turn:vps.example.com:3478"``.
+    turn_user, turn_pass : str | None
+        Long-term credentials for the TURN server.
+
+    Returns
+    -------
+    RTCConfiguration
+    """
+    servers: list[RTCIceServer] = []
+
+    # STUN
+    urls = DEFAULT_STUN if stun_urls is None else list(stun_urls)
+    if urls:
+        servers.append(RTCIceServer(urls=urls))
+
+    # TURN (requires credentials)
+    if turn_url:
+        servers.append(
+            RTCIceServer(
+                urls=[turn_url],
+                username=turn_user or "",
+                credential=turn_pass or "",
+            )
+        )
+
+    return RTCConfiguration(iceServers=servers)
 
 
 def connect_relay(relay_addr, room, role, timeout=20):

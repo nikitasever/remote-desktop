@@ -19,7 +19,7 @@ import os
 
 import numpy as np
 import av
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import VideoStreamTrack
 
 import rtc_common
@@ -64,11 +64,15 @@ class ScreenTrack(VideoStreamTrack):
         return vf
 
 
-def _ice_config(stun):
-    servers = []
-    if stun:
-        servers.append(RTCIceServer(urls=[stun]))
-    return RTCConfiguration(iceServers=servers)
+def _parse_ice(args):
+    """Build RTCConfiguration from CLI args / env vars."""
+    stun_urls = None                       # → default STUN list
+    if args.stun is not None:
+        stun_urls = [u.strip() for u in args.stun.split(",") if u.strip()]
+    turn_url  = args.turn  or os.environ.get("RD_TURN_URL")
+    turn_user = args.turn_user or os.environ.get("RD_TURN_USER")
+    turn_pass = args.turn_pass or os.environ.get("RD_TURN_PASS")
+    return rtc_common.build_ice_config(stun_urls, turn_url, turn_user, turn_pass)
 
 
 async def run(args, stop_event=None):
@@ -76,7 +80,7 @@ async def run(args, stop_event=None):
     injector = host_mod.InputInjector(streamer.real_w, streamer.real_h)
     clip = None
 
-    pc = RTCPeerConnection(_ice_config(args.stun))
+    pc = RTCPeerConnection(_parse_ice(args))
     pc.addTrack(ScreenTrack(streamer, args.fps))
     channel = pc.createDataChannel("control")
 
@@ -143,7 +147,12 @@ def main():
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--quality", type=int, default=70)
-    ap.add_argument("--stun", default="", help="STUN/TURN URL, напр. stun:stun.l.google.com:19302")
+    ap.add_argument("--stun", default=None,
+                    help="STUN URL(s), через запятую. По умолчанию stun:stun.l.google.com:19302; "
+                         "передайте '' чтобы отключить")
+    ap.add_argument("--turn", default="", help="TURN URL, напр. turn:vps:3478 (или env RD_TURN_URL)")
+    ap.add_argument("--turn-user", default="", help="TURN username (или env RD_TURN_USER)")
+    ap.add_argument("--turn-pass", default="", help="TURN password (или env RD_TURN_PASS)")
     args = ap.parse_args()
     try:
         asyncio.run(run(args))

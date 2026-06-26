@@ -9,6 +9,7 @@ RemoteDesktop — единое окно-лаунчер.
 
 import json
 import os
+import random
 import sys
 import traceback
 import threading
@@ -38,6 +39,29 @@ GREEN = "#22c55e"
 RED = "#ef4444"
 YELLOW = "#eab308"
 
+# -- Host ID persistence --
+_HOST_ID_FILE = os.path.join(APP_DIR, "host_id.json")
+
+
+def _get_or_create_host_id():
+    """Load or generate a persistent 9-digit host ID."""
+    try:
+        with open(_HOST_ID_FILE, "r") as f:
+            return json.load(f)["id"]
+    except (FileNotFoundError, KeyError, json.JSONDecodeError):
+        pass
+    new_id = str(random.randint(100_000_000, 999_999_999))
+    os.makedirs(APP_DIR, exist_ok=True)
+    with open(_HOST_ID_FILE, "w") as f:
+        json.dump({"id": new_id}, f)
+    return new_id
+
+
+def _format_id(id_str):
+    """Format '847291035' as '847 291 035' for display."""
+    s = id_str.zfill(9)
+    return f"{s[:3]} {s[3:6]} {s[6:]}"
+
 
 class Args:
     """Простой контейнер атрибутов вместо argparse.Namespace."""
@@ -53,6 +77,7 @@ class Args:
         self.scale = 1.0
         self.codec = "auto"
         self.engine = "auto"   # auto/x264 — видео H.264; tiles — старые плитки
+        self.unique_id = None  # 9-digit host ID for relay routing
         self.__dict__.update(kw)
 
 
@@ -85,7 +110,7 @@ class LauncherUI:
         self.role = tk.StringVar(value=cfg.get("role", "client"))
         self.conn = tk.StringVar(value=cfg.get("conn", "relay"))
         self.address = tk.StringVar(value=cfg.get("address", ""))
-        self.room = tk.StringVar(value=cfg.get("room", "myroom"))
+        self.remote_id = tk.StringVar(value=cfg.get("remote_id", ""))
         self.password = tk.StringVar(value=cfg.get("password", ""))
         self.downloads = tk.StringVar(value=cfg.get("downloads", DEFAULT_DOWNLOADS))
         self.quality = tk.StringVar(value=str(cfg.get("quality", "70")))
@@ -95,6 +120,9 @@ class LauncherUI:
         self.engine = tk.StringVar(value=cfg.get("engine", "Видео H.264"))
         self._show_pw = tk.BooleanVar(value=False)
 
+        # Load/generate persistent host ID
+        self.host_id = _get_or_create_host_id()
+
         # Main container
         self.main_frame = ctk.CTkFrame(root, fg_color=BG_DARK, corner_radius=0)
         self.main_frame.pack(fill="both", expand=True, padx=0, pady=0)
@@ -102,6 +130,7 @@ class LauncherUI:
         self._build_header()
         self._build_role_section(cfg)
         self._build_connection_section()
+        self._build_id_card()
         self._build_fields_section()
         self._build_host_settings()
         self._build_start_button()
@@ -192,8 +221,92 @@ class LauncherUI:
         self.conn.set(self._conn_map_inv.get(value, "relay"))
         self._refresh()
 
+    def _build_id_card(self):
+        """Host ID display card (AnyDesk-style) and client remote ID input."""
+        # -- Host ID card: shown in host+relay mode --
+        self.host_id_wrapper = ctk.CTkFrame(self.main_frame, fg_color="transparent",
+                                            corner_radius=0)
+        # Don't pack yet — _refresh() controls visibility
+
+        self.host_id_card = ctk.CTkFrame(self.host_id_wrapper, fg_color=BG_CARD,
+                                         corner_radius=12, border_width=2,
+                                         border_color=ACCENT)
+        self.host_id_card.pack(fill="x", padx=24, pady=(8, 0))
+
+        id_inner = ctk.CTkFrame(self.host_id_card, fg_color="transparent")
+        id_inner.pack(fill="x", padx=16, pady=14)
+
+        ctk.CTkLabel(id_inner, text="Ваш ID для подключения:",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=TEXT_SECONDARY).pack(anchor="w", padx=4, pady=(0, 8))
+
+        id_row = ctk.CTkFrame(id_inner, fg_color="transparent")
+        id_row.pack(fill="x", padx=4)
+
+        self.host_id_label = ctk.CTkLabel(
+            id_row,
+            text=_format_id(self.host_id),
+            font=ctk.CTkFont(family="Consolas", size=30, weight="bold"),
+            text_color=ACCENT,
+        )
+        self.host_id_label.pack(side="left")
+
+        copy_btn = ctk.CTkButton(
+            id_row, text="Копировать", width=100, height=36,
+            corner_radius=8,
+            font=ctk.CTkFont(size=12),
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color="#ffffff",
+            command=self._copy_host_id,
+        )
+        copy_btn.pack(side="right")
+
+        ctk.CTkLabel(id_inner,
+                     text="Сообщите этот ID и пароль для подключения к вашему ПК",
+                     font=ctk.CTkFont(size=11), text_color=TEXT_HINT,
+                     wraplength=380, justify="left").pack(anchor="w", padx=4, pady=(8, 0))
+
+        # -- Client remote ID input: shown in client+relay mode --
+        self.client_id_wrapper = ctk.CTkFrame(self.main_frame, fg_color="transparent",
+                                              corner_radius=0)
+        # Don't pack yet — _refresh() controls visibility
+
+        client_id_card = ctk.CTkFrame(self.client_id_wrapper, fg_color=BG_CARD,
+                                      corner_radius=12, border_width=1,
+                                      border_color=BORDER)
+        client_id_card.pack(fill="x", padx=24, pady=(8, 0))
+
+        cid_inner = ctk.CTkFrame(client_id_card, fg_color="transparent")
+        cid_inner.pack(fill="x", padx=16, pady=14)
+
+        ctk.CTkLabel(cid_inner, text="ID удалённого ПК:",
+                     font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY).pack(
+                     anchor="w", padx=4, pady=(0, 2))
+        self.remote_id_entry = ctk.CTkEntry(
+            cid_inner, textvariable=self.remote_id,
+            height=40, corner_radius=8,
+            font=ctk.CTkFont(family="Consolas", size=18),
+            fg_color=BG_INPUT, border_color=BORDER,
+            text_color=TEXT_PRIMARY,
+            placeholder_text="xxx xxx xxx",
+            placeholder_text_color=TEXT_HINT,
+        )
+        self.remote_id_entry.pack(fill="x", padx=4, pady=(0, 4))
+
+        ctk.CTkLabel(cid_inner,
+                     text="Введите ID удалённого ПК и пароль",
+                     font=ctk.CTkFont(size=11), text_color=TEXT_HINT,
+                     wraplength=380, justify="left").pack(anchor="w", padx=4, pady=(4, 0))
+
+    def _copy_host_id(self):
+        """Copy host ID to clipboard."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.host_id)
+        self._set_status("connected", "ID скопирован в буфер обмена")
+        self.root.after(2000, lambda: self._set_status("idle", "Готов к подключению"))
+
     def _build_fields_section(self):
-        """Address, room ID, password fields."""
+        """Address and password fields."""
         self.fields_card = self._card(self.main_frame, pad_top=8)
 
         # Address row
@@ -207,18 +320,6 @@ class LauncherUI:
                                        placeholder_text="IP:порт",
                                        placeholder_text_color=TEXT_HINT)
         self.addr_entry.pack(fill="x", padx=4, pady=(0, 8))
-
-        # Room ID row
-        self.room_lbl = ctk.CTkLabel(self.fields_card, text="ID комнаты:",
-                                     font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY)
-        self.room_lbl.pack(anchor="w", padx=4, pady=(0, 2))
-        self.room_entry = ctk.CTkEntry(self.fields_card, textvariable=self.room,
-                                       height=36, corner_radius=8,
-                                       fg_color=BG_INPUT, border_color=BORDER,
-                                       text_color=TEXT_PRIMARY,
-                                       placeholder_text="myroom",
-                                       placeholder_text_color=TEXT_HINT)
-        self.room_entry.pack(fill="x", padx=4, pady=(0, 8))
 
         # Password row
         pw_label_frame = ctk.CTkFrame(self.fields_card, fg_color="transparent")
@@ -437,19 +538,21 @@ class LauncherUI:
         is_host = self.role.get() == "host"
         is_relay = self.conn.get() == "relay"
 
-        # Room ID — only for relay
-        if is_relay:
-            self.room_lbl.pack(anchor="w", padx=4, pady=(0, 2))
-            self.room_entry.pack(fill="x", padx=4, pady=(0, 8))
-        else:
-            self.room_lbl.pack_forget()
-            self.room_entry.pack_forget()
+        # ID cards visibility — unpack all, then re-pack in order
+        self.host_id_wrapper.pack_forget()
+        self.client_id_wrapper.pack_forget()
 
         # Host settings scrollable section visibility.
         # Re-pack bottom elements to maintain correct order after show/hide.
         self.host_wrapper.pack_forget()
         self.btn_frame.pack_forget()
         self.footer_frame.pack_forget()
+
+        # Show appropriate ID card for relay mode
+        if is_relay and is_host:
+            self.host_id_wrapper.pack(fill="x", padx=0, pady=0, before=self.fields_card.master)
+        elif is_relay and not is_host:
+            self.client_id_wrapper.pack(fill="x", padx=0, pady=0, before=self.fields_card.master)
 
         if is_host:
             self.host_wrapper.pack(fill="x", padx=0, pady=0)
@@ -473,8 +576,10 @@ class LauncherUI:
 
         # Hints
         hints = [self.address_hint]
-        if is_relay:
-            hints.append("ID комнаты должен совпадать на обоих ПК.")
+        if is_relay and is_host:
+            hints.append("Сообщите этот ID и пароль для подключения к вашему ПК")
+        elif is_relay and not is_host:
+            hints.append("Введите ID удалённого ПК и пароль")
         hints.append("Пароль одинаковый на обоих ПК — это ключ шифрования.")
         self.hint.configure(text="  •  " + "\n  •  ".join(hints))
 
@@ -489,7 +594,7 @@ class LauncherUI:
         if not pw:
             raise ValueError("Укажите пароль.")
 
-        a = Args(password=pw, id=self.room.get().strip() or "default")
+        a = Args(password=pw, id="default")
         if role == "host":
             a.downloads = self.downloads.get().strip() or DEFAULT_DOWNLOADS
             a.quality = int(self.quality.get())
@@ -500,11 +605,18 @@ class LauncherUI:
                         "Плитки (совместимость)": "tiles"}.get(self.engine.get(), "auto")
             if is_relay:
                 a.relay = addr
+                a.unique_id = self.host_id
             else:
                 a.listen = int(addr)            # тут addr = порт
         else:
             if is_relay:
                 a.relay = addr
+                remote = self.remote_id.get().replace(" ", "").strip()
+                if not remote:
+                    raise ValueError("Укажите ID удалённого ПК.")
+                if not remote.isdigit() or len(remote) != 9:
+                    raise ValueError("ID должен состоять из 9 цифр.")
+                a.unique_id = remote
             else:
                 a.connect = addr
         return role, a
@@ -512,7 +624,7 @@ class LauncherUI:
     def _persist(self):
         save_config({
             "role": self.role.get(), "conn": self.conn.get(),
-            "address": self.address.get(), "room": self.room.get(),
+            "address": self.address.get(), "remote_id": self.remote_id.get(),
             "password": self.password.get(), "downloads": self.downloads.get(),
             "quality": self.quality.get(), "fps": self.fps.get(), "scale": self.scale.get(),
             "codec": self.codec.get(), "engine": self.engine.get(),

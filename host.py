@@ -61,17 +61,40 @@ SPECIAL_KEYS = {
 }
 
 
+def _char_to_vk(ch):
+    """VK-код для печатной клавиши, чтобы слать её как настоящую клавишу
+    (а не Unicode-символ). Нужно для сочетаний с Ctrl/Alt/Win."""
+    o = ord(ch.upper())
+    if 0x41 <= o <= 0x5A:          # A–Z  -> VK_A..VK_Z (0x41..0x5A)
+        return o
+    if len(ch) == 1 and ch.isdigit():
+        return ord(ch)             # 0–9  -> VK_0..VK_9 (0x30..0x39)
+    return None
+
+
 class InputInjector:
     def __init__(self, screen_w, screen_h):
         self.mouse = MouseController()
         self.kb = KeyboardController()
         self.w = screen_w
         self.h = screen_h
+        self._mods_down = set()     # зажатые модификаторы: 'ctrl' | 'alt' | 'cmd'
 
     def _key_from_event(self, ev):
-        if "char" in ev and ev["char"]:
-            return KeyCode.from_char(ev["char"])
-        return SPECIAL_KEYS.get(ev.get("name"))
+        name = ev.get("name")
+        if name:
+            return SPECIAL_KEYS.get(name)
+        ch = ev.get("char")
+        if not ch:
+            return None
+        # Если зажат Ctrl/Alt/Win — печатную клавишу шлём как ВИРТУАЛЬНУЮ.
+        # Иначе pynput вводит Unicode-символ (KEYEVENTF_UNICODE) и сочетание
+        # (Ctrl+C/V/A/Z…) не срабатывает: ОС видит символ, а не клавишу+модификатор.
+        if self._mods_down and len(ch) == 1:
+            vk = _char_to_vk(ch)
+            if vk is not None:
+                return KeyCode.from_vk(vk)
+        return KeyCode.from_char(ch)
 
     def handle(self, ev):
         kind = ev.get("k")
@@ -86,6 +109,12 @@ class InputInjector:
             elif kind == "scroll":
                 self.mouse.scroll(ev.get("dx", 0), ev.get("dy", 0))
             elif kind in ("kdown", "kup"):
+                name = ev.get("name")
+                if name in ("ctrl", "alt", "cmd"):   # отслеживаем зажатые модификаторы
+                    if kind == "kdown":
+                        self._mods_down.add(name)
+                    else:
+                        self._mods_down.discard(name)
                 key = self._key_from_event(ev)
                 if key is not None:
                     (self.kb.press if kind == "kdown" else self.kb.release)(key)

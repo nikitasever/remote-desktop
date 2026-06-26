@@ -27,7 +27,7 @@ import client as client_mod
 
 
 class State:
-    def __init__(self):
+    def __init__(self, mute=False):
         self.lock = threading.Lock()
         self.frame = None          # последний RGB ndarray
         self.alive = True
@@ -35,6 +35,7 @@ class State:
         self.loop = None
         self.rtt = None
         self.connected = False
+        self.mute = mute
 
 
 def _ice_config(stun):
@@ -49,6 +50,8 @@ async def amain(args, state):
     def on_track(track):
         if track.kind == "video":
             asyncio.ensure_future(_consume(track, state))
+        elif track.kind == "audio" and not state.mute:
+            asyncio.ensure_future(_consume_audio(track, state))
 
     @pc.on("datachannel")
     def on_dc(ch):
@@ -103,6 +106,50 @@ async def _consume(track, state):
         img = frame.to_ndarray(format="rgb24")
         with state.lock:
             state.frame = img
+
+
+async def _consume_audio(track, state):
+    """Принимает аудио-трек и воспроизводит через sounddevice."""
+    try:
+        import sounddevice as sd
+    except ImportError:
+        print("[client-rtc] sounddevice не установлен — аудио выключено")
+        return
+
+    out_stream = None
+    try:
+        while state.alive:
+            try:
+                frame = await track.recv()
+            except Exception:
+                break
+            # aiortc декодирует Opus -> av.AudioFrame (s16, 48kHz)
+            pcm = frame.to_ndarray()  # shape: (channels, samples) s16
+            sr = frame.sample_rate or 48000
+            ch = pcm.shape[0] if pcm.ndim == 2 else 1
+            # sounddevice ожидает (samples, channels), int16
+            if pcm.ndim == 2:
+                samples = pcm.T.copy()  # (samples, channels)
+            else:
+                samples = pcm.reshape(-1, 1).copy()
+            if out_stream is None:
+                out_stream = sd.OutputStream(
+                    samplerate=sr, channels=ch, dtype="int16",
+                    blocksize=samples.shape[0],
+                )
+                out_stream.start()
+                print(f"[client-rtc] аудио: воспроизведение {sr} Hz, {ch} ch")
+            try:
+                out_stream.write(samples)
+            except Exception:
+                pass
+    finally:
+        if out_stream is not None:
+            try:
+                out_stream.stop()
+                out_stream.close()
+            except Exception:
+                pass
 
 
 def _start_loop(args, state):
@@ -214,9 +261,10 @@ def main():
     ap.add_argument("--id", default="default", help="ID комнаты")
     ap.add_argument("--password", default="", help="Пока только гейт комнаты (PoC)")
     ap.add_argument("--stun", default="", help="STUN/TURN URL")
+    ap.add_argument("--mute", action="store_true", help="Отключить приём аудио")
     args = ap.parse_args()
 
-    state = State()
+    state = State(mute=args.mute)
     t = threading.Thread(target=_start_loop, args=(args, state), daemon=True)
     t.start()
     try:

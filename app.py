@@ -77,7 +77,8 @@ class LauncherUI:
     def __init__(self, root):
         self.root = root
         root.title("RemoteDesktop")
-        root.resizable(False, False)
+        root.resizable(False, True)
+        root.minsize(480, 400)
         root.configure(fg_color=BG_DARK)
         cfg = load_config()
 
@@ -247,12 +248,35 @@ class LauncherUI:
         self.hint.pack(anchor="w", padx=4, pady=(0, 2))
 
     def _build_host_settings(self):
-        """Host-only settings: downloads dir, quality, fps, scale, codec, engine."""
-        self.host_card = self._card(self.main_frame, pad_top=8)
+        """Host-only settings: downloads dir, quality, fps, scale, codec, engine.
 
-        ctk.CTkLabel(self.host_card, text="Настройки хоста",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(anchor="w", padx=4, pady=(0, 10))
+        Wrapped in a CTkScrollableFrame so it scrolls when the window is too
+        short (e.g. on small displays).
+        """
+        # Outer wrapper — a plain frame used for pack/pack_forget visibility toggling.
+        self.host_wrapper = ctk.CTkFrame(self.main_frame, fg_color="transparent",
+                                         corner_radius=0)
+        self.host_wrapper.pack(fill="both", expand=True, padx=0, pady=0)
+
+        # Scrollable frame styled to look like the existing cards.
+        self.host_scroll = ctk.CTkScrollableFrame(
+            self.host_wrapper,
+            fg_color=BG_CARD,
+            scrollbar_button_color=BORDER,
+            scrollbar_button_hover_color=ACCENT,
+            corner_radius=12,
+            border_width=1,
+            border_color=BORDER,
+            label_text="Настройки хоста",
+            label_font=ctk.CTkFont(size=13, weight="bold"),
+            label_text_color=TEXT_PRIMARY,
+            label_fg_color=BG_CARD,
+            label_anchor="w",
+        )
+        self.host_scroll.pack(fill="both", expand=True, padx=24, pady=(8, 0))
+
+        # Alias for the inner content area (replaces the old self.host_card).
+        self.host_card = self.host_scroll
 
         # Downloads dir
         dl_row = ctk.CTkFrame(self.host_card, fg_color="transparent")
@@ -347,11 +371,11 @@ class LauncherUI:
 
     def _build_start_button(self):
         """Big prominent Connect / Start Host button."""
-        btn_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=24, pady=(12, 4))
+        self.btn_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.btn_frame.pack(fill="x", padx=24, pady=(12, 4))
 
         self.start_btn = ctk.CTkButton(
-            btn_frame,
+            self.btn_frame,
             text="Запустить",
             height=46,
             corner_radius=10,
@@ -365,11 +389,11 @@ class LauncherUI:
 
     def _build_footer(self):
         """Footer with status indicator and version."""
-        footer = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        footer.pack(fill="x", padx=24, pady=(4, 16))
+        self.footer_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.footer_frame.pack(fill="x", padx=24, pady=(4, 16))
 
         # Status dot + text
-        status_row = ctk.CTkFrame(footer, fg_color="transparent")
+        status_row = ctk.CTkFrame(self.footer_frame, fg_color="transparent")
         status_row.pack(side="left")
 
         self.status_dot = ctk.CTkLabel(status_row, text="⬤",
@@ -381,7 +405,7 @@ class LauncherUI:
                                         text_color=TEXT_HINT)
         self.status_text.pack(side="left", padx=(4, 0))
 
-        ctk.CTkLabel(footer, text="v1.0", font=ctk.CTkFont(size=11),
+        ctk.CTkLabel(self.footer_frame, text="v1.0", font=ctk.CTkFont(size=11),
                      text_color=TEXT_HINT).pack(side="right")
 
     # ======== Helpers ========
@@ -430,11 +454,17 @@ class LauncherUI:
             self.room_lbl.pack_forget()
             self.room_entry.pack_forget()
 
-        # Host settings card visibility
+        # Host settings scrollable section visibility.
+        # Re-pack bottom elements to maintain correct order after show/hide.
+        self.host_wrapper.pack_forget()
+        self.btn_frame.pack_forget()
+        self.footer_frame.pack_forget()
+
         if is_host:
-            self.host_card.master.pack(fill="x", padx=24, pady=(8, 0))
-        else:
-            self.host_card.master.pack_forget()
+            self.host_wrapper.pack(fill="both", expand=True, padx=0, pady=0)
+
+        self.btn_frame.pack(fill="x", padx=24, pady=(12, 4))
+        self.footer_frame.pack(fill="x", padx=24, pady=(4, 16))
 
         # Address label text
         if is_relay:

@@ -193,6 +193,8 @@ def run_ui(args, state):
     toolbar_show_time = 0.0
     show_stats = False
     hover_btn = None       # индекс кнопки под курсором
+    is_fullscreen = False
+    windowed_size = (960, 600)  # запоминаем размер окна до перехода в fullscreen
 
     def send(ev):
         ch, loop = state.channel, state.loop
@@ -227,6 +229,19 @@ def run_ui(args, state):
         nonlocal show_stats
         show_stats = not show_stats
 
+    def _fullscreen_label():
+        return "⤢" if not is_fullscreen else "⤣"  # ⤢ / ⤣
+
+    def _toggle_fullscreen():
+        nonlocal win, is_fullscreen, windowed_size
+        if is_fullscreen:
+            is_fullscreen = False
+            win = pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
+        else:
+            windowed_size = win.get_size()
+            is_fullscreen = True
+            win = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+
     def _close_label():
         return "✕"      # ✕
 
@@ -236,6 +251,7 @@ def run_ui(args, state):
     toolbar_buttons = [
         (_mute_label, _toggle_mute),
         (_stats_label, _toggle_stats),
+        (_fullscreen_label, _toggle_fullscreen),
         (_close_label, _close_action),
     ]
     TB_BTN_W = 36
@@ -345,7 +361,8 @@ def run_ui(args, state):
             if event.type == pygame.QUIT:
                 state.alive = False
             elif event.type == pygame.VIDEORESIZE:
-                win = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+                if not is_fullscreen:
+                    win = pygame.display.set_mode(event.size, pygame.RESIZABLE)
             elif event.type == pygame.MOUSEMOTION:
                 mx, my = event.pos
                 # Показать тулбар при наведении на верхний край
@@ -384,6 +401,15 @@ def run_ui(args, state):
                 if event.type == pygame.KEYDOWN and hotkey and event.key == pygame.K_q:
                     state.alive = False
                     break
+                # Fullscreen toggle: F (без модификаторов) или F11
+                if event.type == pygame.KEYDOWN:
+                    no_mods = not (mods & (pygame.KMOD_CTRL | pygame.KMOD_ALT | pygame.KMOD_SHIFT))
+                    if event.key == pygame.K_F11 or (event.key == pygame.K_f and no_mods):
+                        _toggle_fullscreen()
+                        continue
+                    if event.key == pygame.K_ESCAPE and is_fullscreen:
+                        _toggle_fullscreen()
+                        continue
                 if event.type == pygame.KEYDOWN:
                     ident = client_mod.key_ident(event, mods)
                     if ident is not None:

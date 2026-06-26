@@ -18,7 +18,17 @@ Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
 & $py -m PyInstaller --onefile --windowed --name app `
     --hidden-import pynput.keyboard._win32 `
     --hidden-import pynput.mouse._win32 `
+    --hidden-import customtkinter `
     --collect-submodules mss `
+    --collect-submodules customtkinter `
+    --hidden-import host_ui `
+    --hidden-import video `
+    --hidden-import audio `
+    --hidden-import adaptive `
+    --hidden-import rtc_common `
+    --hidden-import host_rtc `
+    --hidden-import client_rtc `
+    --hidden-import service `
     app.py
 
 if (Test-Path ".\dist\app.exe") {

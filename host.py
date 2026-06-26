@@ -456,9 +456,19 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
     def recv_loop():
         try:
             while alive["v"]:
-                mt, body = common.recv_frame(sock, chan)
+                try:
+                    mt, body = common.recv_frame(sock, chan)
+                except (ConnectionError, socket.error):
+                    raise
+                except Exception as e:
+                    LOG(f"[host] ошибка чтения кадра: {e}")
+                    continue
                 if mt == common.MSG_INPUT:
-                    injector.handle(common.parse_json(body))
+                    try:
+                        injector.handle(common.parse_json(body))
+                    except Exception as e:
+                        LOG(f"[host] ошибка ввода в recv_loop: {e}")
+                    continue
                 elif mt == common.MSG_PING:
                     sender.send(common.MSG_PONG, body)  # отражаем как есть
                 elif mt == common.MSG_CLIPBOARD:
@@ -502,6 +512,7 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                 incoming_file["f"].close()
 
     threading.Thread(target=recv_loop, daemon=True).start()
+    LOG("[host] recv_loop запущен (ввод/файлы/clipboard)")
 
     # Отправка кадров — в основном потоке, с ограничением FPS.
     frame_interval = 1.0 / max(1, fps)
@@ -696,7 +707,7 @@ def _run_direct(args, key, params, stop_event):
 def run_host(args, stop_event=None):
     """Цикл хоста. Вызывается из CLI и из GUI."""
     # Генерируем / загружаем уникальный ID хоста
-    BUILD = "2026-06-26-v4"
+    BUILD = "2026-06-26-v5"
     host_id = get_or_create_host_id()
     LOG(f"[host] RemoteDesktop build {BUILD}")
     LOG(f"[host] Ваш ID: {format_host_id(host_id)}")

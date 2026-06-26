@@ -15,6 +15,7 @@ CLIENT через WebRTC (Фаза B) — экспериментальный т�
 import argparse
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -25,6 +26,8 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 
 import rtc_common
 import client as client_mod
+
+log = logging.getLogger(__name__)
 
 
 class State:
@@ -234,13 +237,16 @@ def run_ui(args, state):
 
     def _toggle_fullscreen():
         nonlocal win, is_fullscreen, windowed_size
-        if is_fullscreen:
-            is_fullscreen = False
-            win = pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
-        else:
-            windowed_size = win.get_size()
-            is_fullscreen = True
-            win = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        try:
+            if is_fullscreen:
+                is_fullscreen = False
+                win = pygame.display.set_mode(windowed_size, pygame.RESIZABLE)
+            else:
+                windowed_size = win.get_size()
+                is_fullscreen = True
+                win = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        except pygame.error as exc:
+            log.warning("Fullscreen toggle failed: %s — staying in current mode", exc)
 
     def _close_label():
         return "✕"      # ✕

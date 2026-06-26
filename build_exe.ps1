@@ -19,6 +19,11 @@ Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
     --hidden-import pynput.keyboard._win32 `
     --hidden-import pynput.mouse._win32 `
     --hidden-import customtkinter `
+    --hidden-import pygame `
+    --hidden-import pygame._sdl2 `
+    --hidden-import pygame.display `
+    --hidden-import pygame.event `
+    --collect-submodules pygame `
     --collect-submodules mss `
     --collect-submodules customtkinter `
     --hidden-import host_ui `

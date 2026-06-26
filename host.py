@@ -627,9 +627,8 @@ def run_host(args, stop_event=None):
     host_id = get_or_create_host_id()
     LOG(f"[host] Ваш ID: {format_host_id(host_id)}")
 
-    # Если unique_id ещё не задан извне (GUI), ставим сгенерированный
-    if not getattr(args, "unique_id", None):
-        args.unique_id = host_id
+    # unique_id используется только если задан извне (GUI app.py).
+    # При CLI-запуске с --id (старый протокол) unique_id остаётся None.
 
     key = common.derive_key(args.password)
     params = dict(

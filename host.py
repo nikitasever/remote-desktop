@@ -238,6 +238,8 @@ class ScreenStreamer:
         self.h = max(1, int(round(self.real_h * self.scale)))
         self._prev_hashes = {}   # сброс кэша — отдадим монитор целиком
         self._last_full = None   # хэш всего кадра для пропуска статики
+        self._last_arr = None    # последний реальный кадр (для статичного экрана)
+        self._last_emit = 0.0    # когда последний раз отдали кадр
         self._dx = self._open_dxcam(index)
         LOG(f"[host] захват: {'dxcam (DXGI)' if self._dx else 'mss'} "
             f"монитор {self.index}/{self.count} {self.real_w}x{self.real_h}")
@@ -247,7 +249,23 @@ class ScreenStreamer:
         if self._dx is not None:
             arr = self._dx.grab()        # None, если кадр не изменился (DXGI сам так умеет)
             if arr is None:
-                return None
+                # dxcam отдаёт ТОЛЬКО изменившиеся кадры. На статичном экране
+                # grab() вечно None — без этого клиент не получит ни одного кадра
+                # (чёрный экран). Поэтому:
+                #  1) первый кадр берём принудительно через mss (инициализация);
+                #  2) дальше на статике периодически переотдаём последний кадр
+                #     (нужно для подключения нового клиента и для keyframe).
+                now = time.time()
+                if self._last_arr is None:
+                    raw = self.sct.grab(self.mon)
+                    arr = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(
+                        raw.height, raw.width, 3)
+                elif now - self._last_emit >= 0.5:
+                    arr = self._last_arr
+                else:
+                    return None
+            self._last_arr = arr
+            self._last_emit = time.time()
         else:
             raw = self.sct.grab(self.mon)
             arr = np.frombuffer(raw.rgb, dtype=np.uint8).reshape(raw.height, raw.width, 3)

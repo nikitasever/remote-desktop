@@ -534,13 +534,14 @@ def make_socket(args):
         if resp.startswith("ERROR"):
             raise ConnectionError(f"Relay отклонил регистрацию: {resp}")
         LOG(f"[host] зарегистрирован на relay {args.relay}, ID {format_host_id(unique_id)}, жду клиента...")
+        # Новый протокол: relay блокирует до подключения клиента, затем
+        # сразу начинает pipe. Никакой дополнительной строки не присылает.
     else:
         common.relay_register(s, "host", args.id)
         LOG(f"[host] зарегистрирован на relay {args.relay}, комната '{args.id}', жду клиента...")
-
-    # Relay пришлёт строку, когда клиент подключится.
-    line = common.relay_read_line(s)
-    LOG(f"[host] relay: {line}")
+        # Старый протокол: relay шлёт {"event":"paired"} когда оба подключились.
+        line = common.relay_read_line(s)
+        LOG(f"[host] relay: {line}")
     return s
 
 

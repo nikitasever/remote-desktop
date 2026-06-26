@@ -82,6 +82,8 @@ class RemoteState:
         self.title_dirty = True
         self.alive = True
         self.video_mode = False   # True после MSG_VIDEO_INFO (H.264-поток)
+        self.status = "Подключение к хосту…"  # диагностика для чёрного экрана
+        self.decode_err = None    # последняя ошибка декодера (показать на экране)
         # статистика канала
         self.recv_frames = 0     # счётчик пришедших кадров (MSG_TILES)
         self.recv_bytes = 0      # байт плиток за интервал
@@ -114,15 +116,22 @@ def reader_thread(sock, chan, state, clip, sender=None):
                     state.title_dirty = True
             elif mt == common.MSG_VIDEO_INFO:
                 info = common.parse_json(body)
+                if video_mod is None:
+                    with state.lock:
+                        state.decode_err = "Модуль video (PyAV) недоступен в сборке"
+                    print("[client] video_mod=None — нет PyAV, видео не декодируется")
                 try:
                     decoder = video_mod.VideoDecoder() if video_mod else None
                 except Exception as e:
                     print(f"[client] не удалось создать декодер: {e}")
                     decoder = None
+                    with state.lock:
+                        state.decode_err = f"Не создать декодер: {e}"
                 with state.lock:
                     state.video_mode = True
                     state.w, state.h = info["w"], info["h"]
                     state.title_dirty = True
+                    state.status = f"Жду первый кадр ({info.get('codec')} {info.get('w')}x{info.get('h')})…"
                 print(f"[client] видео-поток: {info.get('codec')} "
                       f"{info.get('w')}x{info.get('h')} @ {info.get('fps')}к/с")
             elif mt == common.MSG_VIDEO:
@@ -135,8 +144,11 @@ def reader_thread(sock, chan, state, clip, sender=None):
                                 state.surface = surf
                                 state.recv_frames += 1
                                 state.recv_bytes += len(body)
+                                state.decode_err = None
                     except Exception as e:
                         print(f"[client] ошибка декода: {e}")
+                        with state.lock:
+                            state.decode_err = f"Ошибка декода: {e}"
             elif mt == common.MSG_TILES:
                 apply_tiles(body, state)
                 with state.lock:
@@ -543,8 +555,30 @@ def run_ui(sender, state, clip):
     threading.Thread(target=ping_loop, args=(sender, state), daemon=True).start()
     last_stat = time.time()
 
-    # Wait for screen info
+    # Ждём первый кадр, НО продолжаем качать события и рисовать статус —
+    # иначе Windows помечает окно «Не отвечает» и оно остаётся чёрным.
+    splash = pygame.font.SysFont("Segoe UI", 22)
+    splash_sm = pygame.font.SysFont("Consolas", 15)
+    t_wait = time.time()
     while state.alive and state.surface is None:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                state.alive = False
+            elif event.type == pygame.VIDEORESIZE:
+                win = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+        with state.lock:
+            status = state.status
+            err = state.decode_err
+        win.fill((17, 24, 39))
+        ww, wh = win.get_size()
+        msg = err or status
+        color = (255, 110, 110) if err else (220, 220, 230)
+        txt = splash.render(msg, True, color)
+        win.blit(txt, (ww // 2 - txt.get_width() // 2, wh // 2 - 20))
+        waited = int(time.time() - t_wait)
+        sub = splash_sm.render(f"ожидание: {waited}s   (Ctrl+Alt+Q — выход)", True, (130, 140, 160))
+        win.blit(sub, (ww // 2 - sub.get_width() // 2, wh // 2 + 18))
+        pygame.display.flip()
         clock.tick(30)
     if not state.alive:
         return
@@ -867,7 +901,9 @@ def main():
     ap = argparse.ArgumentParser(description="Remote desktop CLIENT (просмотрщик)")
     ap.add_argument("--connect", help="Прямой режим: host:порт")
     ap.add_argument("--relay", help="Режим relay: vps:порт")
-    ap.add_argument("--id", default="default", help="ID комнаты для relay")
+    ap.add_argument("--id", default="default", help="ID комнаты для relay (старый протокол)")
+    ap.add_argument("--unique-id", dest="unique_id", default=None,
+                    help="9-значный ID хоста для подключения (новый протокол CONNECT)")
     ap.add_argument("--password", required=True, help="Общий пароль (E2E)")
     args = ap.parse_args()
     if not args.connect and not args.relay:

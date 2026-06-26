@@ -650,7 +650,9 @@ def main():
     ap = argparse.ArgumentParser(description="Remote desktop HOST (управляемый ПК)")
     ap.add_argument("--listen", type=int, help="Прямой режим: слушать порт")
     ap.add_argument("--relay", help="Режим relay: адрес vps:порт")
-    ap.add_argument("--id", default="default", help="ID комнаты для relay")
+    ap.add_argument("--id", default="default", help="ID комнаты для relay (старый протокол)")
+    ap.add_argument("--unique-id", dest="unique_id", default=None,
+                    help="9-значный ID хоста (новый протокол REGISTER)")
     ap.add_argument("--password", required=True, help="Общий пароль (E2E)")
     ap.add_argument("--downloads", default=os.path.join(os.path.expanduser("~"), "RemoteDesktop_received"),
                     help="Папка для принятых файлов")

@@ -24,6 +24,7 @@ from aiortc.mediastreams import VideoStreamTrack
 
 import rtc_common
 import host as host_mod
+import adaptive
 
 LOG = print
 
@@ -36,10 +37,12 @@ class ScreenTrack(VideoStreamTrack):
         super().__init__()
         self.streamer = streamer
         self.fps = max(1, int(fps))
+        self.target_scale = 1.0           # adaptive: 1.0 / 0.75 / 0.5
         self._last = None
         self._pts = 0
         self._next = None
         self._tb = fractions.Fraction(1, self.fps)
+        self._tb_val = 1.0 / self.fps     # float cache for pacing
 
     async def recv(self):
         loop = asyncio.get_event_loop()
@@ -48,7 +51,7 @@ class ScreenTrack(VideoStreamTrack):
             self._next = now
         if self._next > now:
             await asyncio.sleep(self._next - now)
-        self._next += 1.0 / self.fps
+        self._next += self._tb_val
 
         frame = await loop.run_in_executor(None, self.streamer.capture)
         if frame is None:
@@ -57,10 +60,20 @@ class ScreenTrack(VideoStreamTrack):
             frame = np.zeros((self.streamer.h, self.streamer.w, 3), np.uint8)
         self._last = frame
 
+        # --- adaptive downscale ---
+        scale = self.target_scale
+        if scale < 1.0:
+            h, w = frame.shape[:2]
+            new_h, new_w = max(1, int(h * scale)), max(1, int(w * scale))
+            # Use av (Pillow-free, no cv2) for fast resize via VideoFrame
+            tmp = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame), format="rgb24")
+            tmp = tmp.reformat(width=new_w, height=new_h)
+            frame = tmp.to_ndarray(format="rgb24")
+
         vf = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame), format="rgb24")
         vf.pts = self._pts
         self._pts += 1
-        vf.time_base = self._tb
+        vf.time_base = fractions.Fraction(1, max(1, self.fps))
         return vf
 
 
@@ -77,8 +90,13 @@ async def run(args, stop_event=None):
     clip = None
 
     pc = RTCPeerConnection(_ice_config(args.stun))
-    pc.addTrack(ScreenTrack(streamer, args.fps))
+    screen_track = ScreenTrack(streamer, args.fps)
+    pc.addTrack(screen_track)
     channel = pc.createDataChannel("control")
+
+    # Adaptive quality controller
+    qc = adaptive.QualityController(base_fps=args.fps)
+    qc_stop = asyncio.Event()
 
     @channel.on("message")
     def on_message(message):
@@ -117,6 +135,11 @@ async def run(args, stop_event=None):
     await pc.setRemoteDescription(RTCSessionDescription(ans["sdp"], ans["type"]))
     LOG("[host-rtc] соединение устанавливается (ICE/DTLS)...")
 
+    # Start adaptive quality loop
+    qc_task = asyncio.ensure_future(
+        adaptive.run_quality_loop(pc, screen_track, qc, qc_stop)
+    )
+
     # Сигнальный сокет держим открытым до конца: закрытие сразу после обмена
     # ресетит peer через relay до того, как тот дочитает SDP.
     try:
@@ -126,6 +149,11 @@ async def run(args, stop_event=None):
                 break
             await asyncio.sleep(0.3)
     finally:
+        qc_stop.set()
+        try:
+            await asyncio.wait_for(qc_task, timeout=3)
+        except Exception:
+            pass
         try:
             s.close()
         except Exception:

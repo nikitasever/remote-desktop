@@ -165,6 +165,30 @@ def relay_register(sock: socket.socket, role: str, session: str):
     sock.sendall(line.encode("utf-8"))
 
 
+def relay_register_id(sock: socket.socket, unique_id: str) -> str:
+    """Host: register unique 9-digit ID on relay (new protocol)."""
+    sock.sendall(f"REGISTER {unique_id}\n".encode())
+    resp = b""
+    while not resp.endswith(b"\n"):
+        ch = sock.recv(1)
+        if not ch:
+            raise ConnectionError("Relay closed connection during REGISTER")
+        resp += ch
+    return resp.decode().strip()
+
+
+def relay_connect_id(sock: socket.socket, unique_id: str) -> str:
+    """Client: connect to host by unique 9-digit ID via relay (new protocol)."""
+    sock.sendall(f"CONNECT {unique_id}\n".encode())
+    resp = b""
+    while not resp.endswith(b"\n"):
+        ch = sock.recv(1)
+        if not ch:
+            raise ConnectionError("Relay closed connection during CONNECT")
+        resp += ch
+    return resp.decode().strip()
+
+
 def relay_read_line(sock: socket.socket) -> str:
     buf = bytearray()
     while True:

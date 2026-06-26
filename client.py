@@ -808,13 +808,25 @@ def run_ui(sender, state, clip):
 
 
 def make_socket(args):
+    unique_id = getattr(args, "unique_id", None)
+
     if args.relay:
         host, port = args.relay.rsplit(":", 1)
         s = socket.create_connection((host, int(port)))
-        common.relay_register(s, "client", args.id)
-        print(f"[client] подключаюсь через relay {args.relay}, комната '{args.id}'")
-        line = common.relay_read_line(s)
-        print(f"[client] relay: {line}")
+
+        if unique_id:
+            # Новый протокол: CONNECT <9_digit_id>
+            resp = common.relay_connect_id(s, unique_id)
+            if resp.startswith("ERROR"):
+                s.close()
+                raise ConnectionError(f"Relay: {resp}")
+            print(f"[client] подключаюсь через relay {args.relay}, ID {unique_id}")
+        else:
+            # Старый протокол: JSON-регистрация с ролью client
+            common.relay_register(s, "client", args.id)
+            print(f"[client] подключаюсь через relay {args.relay}, комната '{args.id}'")
+            line = common.relay_read_line(s)
+            print(f"[client] relay: {line}")
         return s
     else:
         host, port = args.connect.rsplit(":", 1)

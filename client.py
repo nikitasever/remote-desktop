@@ -867,17 +867,25 @@ def make_socket(args):
 
     if args.relay:
         host, port = args.relay.rsplit(":", 1)
-        s = socket.create_connection((host, int(port)))
+        try:
+            s = socket.create_connection((host, int(port)), timeout=10)
+        except socket.timeout:
+            raise ConnectionError(f"Не удалось подключиться к relay {host}:{port} (таймаут 10с)")
+        except OSError as e:
+            raise ConnectionError(f"Не удалось подключиться к relay {host}:{port}: {e}")
 
         if unique_id:
-            # Новый протокол: CONNECT <9_digit_id>
             resp = common.relay_connect_id(s, unique_id)
+            if "not_found" in resp:
+                s.close()
+                raise ConnectionError(
+                    f"Хост с ID {unique_id} не найден.\n"
+                    f"Убедитесь, что хост запущен и подключён к relay.")
             if resp.startswith("ERROR"):
                 s.close()
-                raise ConnectionError(f"Relay: {resp}")
+                raise ConnectionError(f"Relay отклонил подключение: {resp}")
             print(f"[client] подключаюсь через relay {args.relay}, ID {unique_id}")
         else:
-            # Старый протокол: JSON-регистрация с ролью client
             common.relay_register(s, "client", args.id)
             print(f"[client] подключаюсь через relay {args.relay}, комната '{args.id}'")
             line = common.relay_read_line(s)
@@ -885,7 +893,10 @@ def make_socket(args):
         return s
     else:
         host, port = args.connect.rsplit(":", 1)
-        s = socket.create_connection((host, int(port)))
+        try:
+            s = socket.create_connection((host, int(port)), timeout=10)
+        except (socket.timeout, OSError) as e:
+            raise ConnectionError(f"Не удалось подключиться к {host}:{port}: {e}")
         print(f"[client] подключился к {args.connect}")
         return s
 
@@ -898,24 +909,35 @@ def run_client(args):
     common.enable_keepalive(sock)
     chan = common.SecureChannel(key)
 
-    # HELLO — host проверит пароль (расшифровка) и узнает, умеем ли мы видео.
     import json as _json
-    common.send_frame(sock, chan, common.MSG_HELLO,
-                      _json.dumps({"video": video_mod is not None}).encode("utf-8"))
+    try:
+        common.send_frame(sock, chan, common.MSG_HELLO,
+                          _json.dumps({"video": video_mod is not None}).encode("utf-8"))
+    except (ConnectionError, socket.error, OSError) as e:
+        sock.close()
+        raise ConnectionError(
+            f"Соединение разорвано при отправке HELLO.\n"
+            f"Возможно, неверный пароль или хост закрыл соединение.\n({e})")
 
     sender = common.FrameSender(sock, chan)
     clip = common.ClipboardSync(lambda txt: sender.send_json(common.MSG_CLIPBOARD, {"text": txt}))
     clip.start()
 
     state = RemoteState()
+    state.downloads_dir = getattr(args, "downloads", DEFAULT_DOWNLOADS)
     t = threading.Thread(target=reader_thread, args=(sock, chan, state, clip, sender), daemon=True)
     t.start()
     try:
         run_ui(sender, state, clip)
+    except Exception as e:
+        print(f"[client] ошибка UI: {e}")
     finally:
         state.alive = False
         clip.stop()
-        sock.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def main():

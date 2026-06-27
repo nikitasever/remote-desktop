@@ -642,15 +642,14 @@ class LauncherUI:
         if role == "host":
             self._run_host_window(args)
         else:
-            # Клиент: закрываем форму и открываем pygame-окно в главном потоке.
-            self.root.destroy()
+            self.root.withdraw()
             try:
                 client.run_client(args)
             except Exception as e:
-                # GUI уже закрыт — покажем отдельным окном
-                err = tk.Tk(); err.withdraw()
-                messagebox.showerror("Ошибка подключения", str(e))
-                err.destroy()
+                self.root.deiconify()
+                messagebox.showerror("Ошибка подключения", str(e), parent=self.root)
+                return
+            self.root.destroy()
 
     def _run_host_window(self, args):
         """Прячем форму, показываем окно-лог хоста (dark-themed)."""

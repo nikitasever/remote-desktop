@@ -581,6 +581,8 @@ class LauncherUI:
         if updater is not None:
             try:
                 updater.check_and_update()
+            except RuntimeError:
+                messagebox.showinfo("Обновление", "Установлена актуальная версия", parent=self.root)
             except Exception as e:
                 messagebox.showerror("Обновление", str(e), parent=self.root)
 

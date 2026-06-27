@@ -329,14 +329,14 @@ class LauncherUI:
         right_frame.pack(side="right", pady=10)
 
         if updater is not None:
-            update_btn = ctk.CTkButton(
+            self._update_btn = ctk.CTkButton(
                 right_frame, text="Обновление", width=90, height=30,
                 corner_radius=8, font=ctk.CTkFont(size=11),
                 fg_color=BG_INPUT, hover_color=BORDER,
                 text_color=TEXT_SECONDARY,
                 command=self._on_update,
             )
-            update_btn.pack(side="left", padx=(0, 6))
+            self._update_btn.pack(side="left", padx=(0, 6))
 
         settings_btn = ctk.CTkButton(
             right_frame, text="⚙", width=34, height=34,
@@ -748,13 +748,52 @@ class LauncherUI:
         self.pw_entry.configure(show="" if self._show_pw.get() else "*")
 
     def _on_update(self):
-        if updater is not None:
+        if updater is None:
+            return
+        self._update_status_label = None
+        # Find or create a status label for progress
+        try:
+            if hasattr(self, '_update_btn'):
+                self._update_btn.configure(state="disabled", text="Проверка...")
+        except Exception:
+            pass
+
+        def _do_update():
             try:
-                updater.check_and_update()
-            except RuntimeError:
-                messagebox.showinfo("Обновление", "Установлена актуальная версия", parent=self.root)
+                has_update, latest, url, changelog = updater.check_for_update()
+                if not has_update:
+                    self.root.after(0, lambda: self._update_done(None, "Установлена актуальная версия"))
+                    return
+                self.root.after(0, lambda: self._update_progress_text("Скачивание..."))
+                def _progress(downloaded, total):
+                    if total > 0:
+                        pct = int(downloaded * 100 / total)
+                        self.root.after(0, lambda p=pct: self._update_progress_text(f"Скачивание: {p}%"))
+                new_exe = updater.download_update(url, _progress)
+                self.root.after(0, lambda: self._update_progress_text("Установка..."))
+                updater.apply_update(new_exe)
             except Exception as e:
-                messagebox.showerror("Обновление", str(e), parent=self.root)
+                self.root.after(0, lambda err=str(e): self._update_done(err, None))
+
+        threading.Thread(target=_do_update, daemon=True).start()
+
+    def _update_progress_text(self, text):
+        try:
+            if hasattr(self, '_update_btn'):
+                self._update_btn.configure(text=text)
+        except Exception:
+            pass
+
+    def _update_done(self, error, info):
+        try:
+            if hasattr(self, '_update_btn'):
+                self._update_btn.configure(state="normal", text="Обновление")
+        except Exception:
+            pass
+        if error:
+            messagebox.showerror("Обновление", error, parent=self.root)
+        elif info:
+            messagebox.showinfo("Обновление", info, parent=self.root)
 
     def _on_host_toggle(self):
         hosting = self.host_switch.get()  # 1 or 0

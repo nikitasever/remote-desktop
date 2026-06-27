@@ -236,6 +236,22 @@ class LauncherUI:
             return
         self._gradient_id = self.root.after(50, self._start_gradient_animation)
 
+    def _animate_title_colors(self):
+        """Cycle title labels through random rainbow colors."""
+        self._title_hue_step += 1
+        h1 = (self._title_hue_step * 0.02) % 1.0
+        h2 = (h1 + 0.5) % 1.0
+        self._title_remote.configure(text_color=self._hue_to_hex(h1))
+        self._title_desktop.configure(text_color=self._hue_to_hex(h2))
+        self.root.after(60, self._animate_title_colors)
+
+    @staticmethod
+    def _hue_to_hex(h):
+        """Convert hue (0-1) to a bright saturated hex color."""
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb(h, 0.75, 0.95)
+        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
     def _start_id_pulse(self):
         """Pulse the host ID label color between ACCENT and ACCENT_BRIGHT."""
         self._id_pulse_step += 1
@@ -297,10 +313,16 @@ class LauncherUI:
                                   corner_radius=2)
         accent_bar.pack(side="left", padx=(0, 8))
 
-        ctk.CTkLabel(name_frame, text="Remote", font=ctk.CTkFont(size=20, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(side="left")
-        ctk.CTkLabel(name_frame, text="Desktop", font=ctk.CTkFont(size=20, weight="bold"),
-                     text_color=ACCENT).pack(side="left")
+        self._title_remote = ctk.CTkLabel(name_frame, text="Remote",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color=TEXT_PRIMARY)
+        self._title_remote.pack(side="left")
+        self._title_desktop = ctk.CTkLabel(name_frame, text="Desktop",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color=ACCENT)
+        self._title_desktop.pack(side="left")
+        self._title_hue_step = 0
+        self._animate_title_colors()
 
         # -- Right: update + settings --
         right_frame = ctk.CTkFrame(inner, fg_color="transparent")

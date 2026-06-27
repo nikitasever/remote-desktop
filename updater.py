@@ -140,6 +140,18 @@ del "%~f0"
     sys.exit(0)
 
 
+def check_and_update(progress_callback=None):
+    """
+    All-in-one: check for update, download if available, apply.
+    Raises RuntimeError with user-facing message on no-update or errors.
+    """
+    has_update, latest, url, changelog = check_for_update()
+    if not has_update:
+        raise RuntimeError(f"Установлена актуальная версия ({__version__}).")
+    new_exe = download_update(url, progress_callback)
+    apply_update(new_exe)
+
+
 def cleanup_old_update():
     """Delete leftover files from a previous update. Call at app startup."""
     if not is_frozen():

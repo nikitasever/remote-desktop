@@ -1,0 +1,154 @@
+"""
+Self-update module for remote-desktop.
+Uses GitHub Releases as the update source. Stdlib only.
+"""
+
+import json
+import os
+import sys
+import subprocess
+import tempfile
+import urllib.request
+import urllib.error
+from version import __version__
+
+GITHUB_API_URL = "https://api.github.com/repos/nikitasever/remote-desktop/releases/latest"
+ASSET_NAME = "app.exe"
+
+
+def _parse_version(v: str):
+    """Parse version string like '1.2.3' into tuple of ints."""
+    v = v.lstrip("vV")
+    parts = []
+    for p in v.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def is_frozen() -> bool:
+    """True if running as a PyInstaller bundle."""
+    return getattr(sys, "frozen", False)
+
+
+def check_for_update() -> tuple:
+    """
+    Check GitHub for a newer release.
+    Returns (has_update, latest_version, download_url, changelog).
+    On error returns (False, __version__, "", "").
+    """
+    try:
+        req = urllib.request.Request(GITHUB_API_URL, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return (False, __version__, "", "")
+
+    tag = data.get("tag_name", "")
+    latest = tag.lstrip("vV")
+    changelog = data.get("body", "") or ""
+
+    if _parse_version(latest) <= _parse_version(__version__):
+        return (False, latest, "", changelog)
+
+    # Find the exe asset
+    download_url = ""
+    for asset in data.get("assets", []):
+        if asset.get("name", "").lower() == ASSET_NAME:
+            download_url = asset["browser_download_url"]
+            break
+
+    if not download_url:
+        return (False, latest, "", changelog)
+
+    return (True, latest, download_url, changelog)
+
+
+def download_update(url: str, progress_callback=None) -> str:
+    """
+    Download the new exe to a temp file.
+    progress_callback(bytes_downloaded, total_bytes) is called periodically.
+    Returns path to the downloaded file.
+    """
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        total = int(resp.headers.get("Content-Length", 0))
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe", prefix="rd_update_")
+        tmp_path = tmp.name
+        downloaded = 0
+        chunk_size = 64 * 1024
+        try:
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback:
+                    progress_callback(downloaded, total)
+        finally:
+            tmp.close()
+    return tmp_path
+
+
+def apply_update(new_exe_path: str):
+    """
+    Replace the running exe with the new one via a helper batch script.
+    Only works when frozen (PyInstaller exe). In dev mode prints a message.
+    """
+    if not is_frozen():
+        print(f"[updater] Dev mode: new exe downloaded to {new_exe_path}")
+        print("[updater] apply_update only works in frozen (PyInstaller) builds.")
+        return
+
+    current_exe = sys.executable
+    exe_dir = os.path.dirname(current_exe)
+    exe_name = os.path.basename(current_exe)
+    old_name = exe_name.replace(".exe", ".old.exe")
+    new_basename = os.path.basename(new_exe_path)
+
+    bat_path = os.path.join(exe_dir, "_update.bat")
+    pid = os.getpid()
+
+    bat_content = f"""@echo off
+echo Waiting for old process to exit...
+:wait
+tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >NUL
+    goto wait
+)
+echo Replacing exe...
+if exist "{os.path.join(exe_dir, old_name)}" del /f "{os.path.join(exe_dir, old_name)}"
+ren "{current_exe}" "{old_name}"
+move /y "{new_exe_path}" "{current_exe}"
+echo Starting new version...
+start "" "{current_exe}"
+del "%~f0"
+"""
+
+    with open(bat_path, "w", encoding="ascii") as f:
+        f.write(bat_content)
+
+    subprocess.Popen(
+        ["cmd.exe", "/c", bat_path],
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        close_fds=True,
+    )
+    sys.exit(0)
+
+
+def cleanup_old_update():
+    """Delete leftover files from a previous update. Call at app startup."""
+    if not is_frozen():
+        return
+    exe_dir = os.path.dirname(sys.executable)
+    for name in ("app.old.exe", "_update.bat"):
+        path = os.path.join(exe_dir, name)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass

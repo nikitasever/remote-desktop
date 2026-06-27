@@ -15,7 +15,7 @@ Write-Host "Устанавливаю зависимости + PyInstaller..." -F
 & $py -m pip install pyinstaller
 
 Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
-& $py -m PyInstaller --onefile --windowed --name app `
+& $py -m PyInstaller --onefile --windowed --noupx --name app `
     --hidden-import pynput.keyboard._win32 `
     --hidden-import pynput.mouse._win32 `
     --hidden-import customtkinter `
@@ -34,6 +34,16 @@ Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
     --hidden-import host_rtc `
     --hidden-import client_rtc `
     --hidden-import service `
+    --hidden-import cv2 `
+    --collect-submodules cv2 `
+    --hidden-import settings_ui `
+    --hidden-import settings_config `
+    --hidden-import settings_display `
+    --hidden-import settings_interface `
+    --hidden-import settings_security `
+    --hidden-import settings_connection `
+    --hidden-import settings_audio `
+    --hidden-import settings_autostart `
     app.py
 
 if (Test-Path ".\dist\app.exe") {

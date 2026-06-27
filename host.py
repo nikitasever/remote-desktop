@@ -490,20 +490,36 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                     pending_monitor["v"] = int(common.parse_json(body).get("index", 1))
                 elif mt == common.MSG_FILE_META:
                     meta = common.parse_json(body)
-                    os.makedirs(downloads_dir, exist_ok=True)
-                    safe = os.path.basename(meta["name"]) or "file.bin"
-                    path = os.path.join(downloads_dir, safe)
-                    incoming_file["f"] = open(path, "wb")
-                    incoming_file["name"] = path
-                    LOG(f"[host] приём файла: {path} ({meta.get('size', '?')} байт)")
+                    try:
+                        os.makedirs(downloads_dir, exist_ok=True)
+                        safe = os.path.basename(meta["name"]) or "file.bin"
+                        path = os.path.join(downloads_dir, safe)
+                        incoming_file["f"] = open(path, "wb")
+                        incoming_file["name"] = path
+                        LOG(f"[host] приём файла: {path} ({meta.get('size', '?')} байт)")
+                    except OSError as e:
+                        LOG(f"[host] ошибка создания файла {meta.get('name')}: {e}")
+                        incoming_file["f"] = None
                 elif mt == common.MSG_FILE_CHUNK:
                     if incoming_file["f"]:
-                        incoming_file["f"].write(body)
+                        try:
+                            incoming_file["f"].write(body)
+                        except OSError as e:
+                            LOG(f"[host] ошибка записи чанка: {e}")
+                            try:
+                                incoming_file["f"].close()
+                            except OSError:
+                                pass
+                            incoming_file["f"] = None
+                    else:
+                        LOG(f"[host] FILE_CHUNK без файла, {len(body)} байт потеряно")
                 elif mt == common.MSG_FILE_END:
                     if incoming_file["f"]:
                         incoming_file["f"].close()
                         LOG(f"[host] файл сохранён: {incoming_file['name']}")
                         incoming_file["f"] = None
+                    else:
+                        LOG("[host] FILE_END без открытого файла")
                 elif mt == common.MSG_DIR_LIST_REQ:
                     req = common.parse_json(body)
                     req_path = req.get("path", "")

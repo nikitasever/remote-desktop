@@ -8,6 +8,7 @@ cryptography>=42.0
 pyperclip>=1.8     # синхронизация буфера обмена
 av>=12,<17         # H.264 кодек экрана; верх ограничен совместимостью с aiortc
 dxcam>=0.3         # GPU-захват экрана (DXGI) на host; фолбэк на mss
+opencv-python-headless>=4.8  # dxcam зависимость
 aiortc>=1.14       # Фаза B: WebRTC-транспорт (UDP/DTLS-SRTP, NAT-traversal)
 PyAudioWPatch>=0.2.12  # WASAPI loopback: захват системного звука (host)
 sounddevice>=0.5       # Воспроизведение аудио на клиенте

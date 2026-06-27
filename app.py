@@ -1,8 +1,5 @@
 """
-RemoteDesktop — единое окно-лаунчер.
-
-Выбираете режим (этот ПК показывает экран / подключиться к другому ПК),
-вводите адрес и пароль — и нажимаете «Запустить». Командная строка не нужна.
+RemoteDesktop — единое окно-лаунчер (AnyDesk-style UI).
 
 Собирается в один app.exe (см. build_exe.ps1).
 """
@@ -20,6 +17,23 @@ import customtkinter as ctk
 
 import host
 import client
+import settings_ui
+
+# Optional modules — UI works without them
+try:
+    import session_history
+except ImportError:
+    session_history = None
+
+try:
+    import lan_discovery
+except ImportError:
+    lan_discovery = None
+
+try:
+    import updater
+except ImportError:
+    updater = None
 
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RemoteDesktop")
 CONFIG = os.path.join(APP_DIR, "config.json")
@@ -76,8 +90,8 @@ class Args:
         self.fps = 18
         self.scale = 1.0
         self.codec = "auto"
-        self.engine = "auto"   # auto/x264 — видео H.264; tiles — старые плитки
-        self.unique_id = None  # 9-digit host ID for relay routing
+        self.engine = "auto"
+        self.unique_id = None
         self.__dict__.update(kw)
 
 
@@ -98,12 +112,40 @@ def save_config(data):
         pass
 
 
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _rgb_to_hex(r, g, b):
+    return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+
+
+def _lerp_color(c1, c2, t):
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r2, g2, b2 = _hex_to_rgb(c2)
+    return _rgb_to_hex(r1 + (r2 - r1) * t, g1 + (g2 - g1) * t, b1 + (b2 - b1) * t)
+
+
+def _animate_button_hover(btn, target_color, current_color, base_color, step=0):
+    """Smooth color transition on hover/leave."""
+    t = min((step + 1) / 6.0, 1.0)
+    c = _lerp_color(base_color, target_color, t)
+    try:
+        btn.configure(fg_color=c)
+    except Exception:
+        return
+    if t < 1.0:
+        btn.after(16, _animate_button_hover, btn, target_color, c, base_color, step + 1)
+
+
 class LauncherUI:
     def __init__(self, root):
         self.root = root
+        self._status_pulse_id = None
         root.title("RemoteDesktop")
         root.resizable(True, True)
-        root.minsize(480, 400)
+        root.minsize(520, 600)
         root.configure(fg_color=BG_DARK)
         cfg = load_config()
 
@@ -119,372 +161,241 @@ class LauncherUI:
         self.codec = tk.StringVar(value=cfg.get("codec", "Авто"))
         self.engine = tk.StringVar(value=cfg.get("engine", "Видео H.264"))
         self._show_pw = tk.BooleanVar(value=False)
+        self._hosting = tk.BooleanVar(value=cfg.get("hosting", False))
+        self._active_tab = tk.StringVar(value="recent")
 
-        # Load/generate persistent host ID
         self.host_id = _get_or_create_host_id()
 
-        # Main container
+        # Main scrollable container
         self.main_frame = ctk.CTkFrame(root, fg_color=BG_DARK, corner_radius=0)
         self.main_frame.pack(fill="both", expand=True, padx=0, pady=0)
 
-        self._build_header()
-        self._build_role_section(cfg)
-        self._build_connection_section()
-        self._build_id_card()
-        self._build_fields_section()
-        self._build_host_settings()
-        self._build_start_button()
+        self._build_top_bar()
+        self._build_id_section()
+        self._build_host_toggle()
+        self._build_tab_bar()
+        self._build_tab_content()
         self._build_footer()
-        self._refresh()
 
-    # ======== UI construction ========
+        self._switch_tab("recent")
 
-    def _build_header(self):
-        """Logo / title area at the top."""
-        header = ctk.CTkFrame(self.main_frame, fg_color=BG_DARK, corner_radius=0)
-        header.pack(fill="x", padx=24, pady=(20, 4))
+    # ================================================================
+    #  UI CONSTRUCTION
+    # ================================================================
 
-        title_frame = ctk.CTkFrame(header, fg_color="transparent")
-        title_frame.pack(anchor="w")
+    def _build_top_bar(self):
+        """Top bar: logo left, address input center, settings+update right."""
+        bar = ctk.CTkFrame(self.main_frame, fg_color=BG_CARD, corner_radius=0, height=56)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
 
-        # Colored accent bar
-        accent_bar = ctk.CTkFrame(title_frame, fg_color=ACCENT, width=4, height=32,
+        inner = ctk.CTkFrame(bar, fg_color="transparent")
+        inner.pack(fill="x", padx=16, pady=0, expand=True)
+
+        # -- Left: app name --
+        name_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        name_frame.pack(side="left", pady=10)
+
+        accent_bar = ctk.CTkFrame(name_frame, fg_color=ACCENT, width=4, height=28,
                                   corner_radius=2)
-        accent_bar.pack(side="left", padx=(0, 12))
+        accent_bar.pack(side="left", padx=(0, 8))
 
-        ctk.CTkLabel(title_frame, text="Remote", font=ctk.CTkFont(size=26, weight="bold"),
+        ctk.CTkLabel(name_frame, text="Remote", font=ctk.CTkFont(size=20, weight="bold"),
                      text_color=TEXT_PRIMARY).pack(side="left")
-        ctk.CTkLabel(title_frame, text="Desktop", font=ctk.CTkFont(size=26, weight="bold"),
+        ctk.CTkLabel(name_frame, text="Desktop", font=ctk.CTkFont(size=20, weight="bold"),
                      text_color=ACCENT).pack(side="left")
 
-    def _build_role_section(self, cfg):
-        """Role selector: segmented button for host / client."""
-        card = self._card(self.main_frame, pad_top=12)
+        # -- Right: update + settings --
+        right_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        right_frame.pack(side="right", pady=10)
 
-        ctk.CTkLabel(card, text="Режим работы", font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(anchor="w", padx=4, pady=(0, 8))
+        if updater is not None:
+            update_btn = ctk.CTkButton(
+                right_frame, text="Обновление", width=90, height=30,
+                corner_radius=8, font=ctk.CTkFont(size=11),
+                fg_color=BG_INPUT, hover_color=BORDER,
+                text_color=TEXT_SECONDARY,
+                command=self._on_update,
+            )
+            update_btn.pack(side="left", padx=(0, 6))
 
-        role_map = {"client": "Подключиться к ПК", "host": "Этот ПК (дать управление)"}
-        initial = role_map.get(self.role.get(), "Подключиться к ПК")
-
-        self.role_seg = ctk.CTkSegmentedButton(
-            card,
-            values=list(role_map.values()),
-            command=self._on_role_change,
-            font=ctk.CTkFont(size=13),
-            fg_color=BG_INPUT,
-            selected_color=ACCENT,
-            selected_hover_color=ACCENT_HOVER,
-            unselected_color=BG_INPUT,
-            unselected_hover_color=BORDER,
-            text_color=TEXT_PRIMARY,
-            text_color_disabled=TEXT_HINT,
-            corner_radius=8,
+        settings_btn = ctk.CTkButton(
+            right_frame, text="⚙", width=34, height=34,
+            corner_radius=8, font=ctk.CTkFont(size=18),
+            fg_color=BG_INPUT, hover_color=BORDER,
+            text_color=TEXT_SECONDARY,
+            command=lambda: settings_ui.open_settings(self.root),
         )
-        self.role_seg.set(initial)
-        self.role_seg.pack(fill="x", padx=4)
-        self._role_map_inv = {v: k for k, v in role_map.items()}
+        settings_btn.pack(side="left")
 
-    def _on_role_change(self, value):
-        self.role.set(self._role_map_inv.get(value, "client"))
-        self._refresh()
+        # -- Center: address entry + connect button --
+        center = ctk.CTkFrame(inner, fg_color="transparent")
+        center.pack(side="left", fill="x", expand=True, padx=20, pady=10)
 
-    def _build_connection_section(self):
-        """Connection type: relay vs direct."""
-        card = self._card(self.main_frame, pad_top=8)
+        addr_frame = ctk.CTkFrame(center, fg_color=BG_INPUT, corner_radius=8,
+                                  border_width=1, border_color=BORDER)
+        addr_frame.pack(fill="x")
 
-        ctk.CTkLabel(card, text="Соединение", font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(anchor="w", padx=4, pady=(0, 8))
+        addr_inner = ctk.CTkFrame(addr_frame, fg_color="transparent")
+        addr_inner.pack(fill="x", padx=2, pady=2)
 
-        conn_map = {"relay": "Relay (NAT)", "direct": "Прямое (LAN)"}
-        initial = conn_map.get(self.conn.get(), "Relay (NAT)")
-
-        self.conn_seg = ctk.CTkSegmentedButton(
-            card,
-            values=list(conn_map.values()),
-            command=self._on_conn_change,
-            font=ctk.CTkFont(size=13),
-            fg_color=BG_INPUT,
-            selected_color=ACCENT,
-            selected_hover_color=ACCENT_HOVER,
-            unselected_color=BG_INPUT,
-            unselected_hover_color=BORDER,
+        self.remote_id_entry = ctk.CTkEntry(
+            addr_inner, textvariable=self.remote_id,
+            height=32, corner_radius=6,
+            font=ctk.CTkFont(family="Consolas", size=14),
+            fg_color=BG_INPUT, border_width=0,
             text_color=TEXT_PRIMARY,
-            text_color_disabled=TEXT_HINT,
-            corner_radius=8,
+            placeholder_text="Введите удалённый адрес",
+            placeholder_text_color=TEXT_HINT,
         )
-        self.conn_seg.set(initial)
-        self.conn_seg.pack(fill="x", padx=4)
-        self._conn_map_inv = {v: k for k, v in conn_map.items()}
+        self.remote_id_entry.pack(side="left", fill="x", expand=True)
 
-    def _on_conn_change(self, value):
-        self.conn.set(self._conn_map_inv.get(value, "relay"))
-        self._refresh()
+        connect_btn = ctk.CTkButton(
+            addr_inner, text="➜", width=36, height=32,
+            corner_radius=6, font=ctk.CTkFont(size=16, weight="bold"),
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color="#ffffff",
+            command=self._on_connect,
+        )
+        connect_btn.pack(side="right", padx=(4, 0))
 
-    def _build_id_card(self):
-        """Host ID display card (AnyDesk-style) and client remote ID input."""
-        # -- Host ID card: shown in host+relay mode --
-        self.host_id_wrapper = ctk.CTkFrame(self.main_frame, fg_color="transparent",
-                                            corner_radius=0)
-        # Don't pack yet — _refresh() controls visibility
+    def _build_id_section(self):
+        """Big ID display: 'Это рабочее место' + formatted ID + copy."""
+        id_section = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        id_section.pack(fill="x", padx=24, pady=(24, 0))
 
-        self.host_id_card = ctk.CTkFrame(self.host_id_wrapper, fg_color=BG_CARD,
-                                         corner_radius=12, border_width=2,
-                                         border_color=ACCENT)
-        self.host_id_card.pack(fill="x", padx=24, pady=(8, 0))
+        ctk.CTkLabel(id_section, text="Это рабочее место",
+                     font=ctk.CTkFont(size=14),
+                     text_color=TEXT_SECONDARY).pack(anchor="center")
 
-        id_inner = ctk.CTkFrame(self.host_id_card, fg_color="transparent")
-        id_inner.pack(fill="x", padx=16, pady=14)
-
-        ctk.CTkLabel(id_inner, text="Ваш ID для подключения:",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=TEXT_SECONDARY).pack(anchor="w", padx=4, pady=(0, 8))
-
-        id_row = ctk.CTkFrame(id_inner, fg_color="transparent")
-        id_row.pack(fill="x", padx=4)
+        id_row = ctk.CTkFrame(id_section, fg_color="transparent")
+        id_row.pack(anchor="center", pady=(6, 0))
 
         self.host_id_label = ctk.CTkLabel(
             id_row,
             text=_format_id(self.host_id),
-            font=ctk.CTkFont(family="Consolas", size=30, weight="bold"),
+            font=ctk.CTkFont(family="Consolas", size=38, weight="bold"),
             text_color=ACCENT,
         )
         self.host_id_label.pack(side="left")
 
         copy_btn = ctk.CTkButton(
-            id_row, text="Копировать", width=100, height=36,
-            corner_radius=8,
-            font=ctk.CTkFont(size=12),
-            fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            text_color="#ffffff",
+            id_row, text="\U0001f4cb", width=36, height=36,
+            corner_radius=8, font=ctk.CTkFont(size=16),
+            fg_color=BG_CARD, hover_color=BORDER,
+            text_color=TEXT_SECONDARY,
             command=self._copy_host_id,
         )
-        copy_btn.pack(side="right")
+        copy_btn.pack(side="left", padx=(12, 0))
 
-        ctk.CTkLabel(id_inner,
-                     text="Сообщите этот ID и пароль для подключения к вашему ПК",
-                     font=ctk.CTkFont(size=11), text_color=TEXT_HINT,
-                     wraplength=380, justify="left").pack(anchor="w", padx=4, pady=(8, 0))
+    def _build_host_toggle(self):
+        """Host mode switch: 'Принимать подключения'."""
+        toggle_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        toggle_frame.pack(fill="x", padx=24, pady=(16, 0))
 
-        # -- Client remote ID input: shown in client+relay mode --
-        self.client_id_wrapper = ctk.CTkFrame(self.main_frame, fg_color="transparent",
-                                              corner_radius=0)
-        # Don't pack yet — _refresh() controls visibility
+        inner = ctk.CTkFrame(toggle_frame, fg_color=BG_CARD, corner_radius=10,
+                             border_width=1, border_color=BORDER)
+        inner.pack(fill="x")
 
-        client_id_card = ctk.CTkFrame(self.client_id_wrapper, fg_color=BG_CARD,
-                                      corner_radius=12, border_width=1,
-                                      border_color=BORDER)
-        client_id_card.pack(fill="x", padx=24, pady=(8, 0))
+        row = ctk.CTkFrame(inner, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=10)
 
-        cid_inner = ctk.CTkFrame(client_id_card, fg_color="transparent")
-        cid_inner.pack(fill="x", padx=16, pady=14)
+        ctk.CTkLabel(row, text="Принимать подключения",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=TEXT_PRIMARY).pack(side="left")
 
-        ctk.CTkLabel(cid_inner, text="ID удалённого ПК:",
-                     font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY).pack(
-                     anchor="w", padx=4, pady=(0, 2))
-        self.remote_id_entry = ctk.CTkEntry(
-            cid_inner, textvariable=self.remote_id,
-            height=40, corner_radius=8,
-            font=ctk.CTkFont(family="Consolas", size=18),
+        self.host_switch = ctk.CTkSwitch(
+            row, text="", width=46,
+            fg_color=BORDER, progress_color=GREEN,
+            button_color=TEXT_PRIMARY, button_hover_color="#ffffff",
+            command=self._on_host_toggle,
+        )
+        if self._hosting.get():
+            self.host_switch.select()
+        self.host_switch.pack(side="right")
+
+        # Password row inside the same card
+        pw_row = ctk.CTkFrame(inner, fg_color="transparent")
+        pw_row.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(pw_row, text="Пароль:",
+                     font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY).pack(side="left")
+
+        self.pw_entry = ctk.CTkEntry(
+            pw_row, textvariable=self.password,
+            height=30, width=160, corner_radius=6, show="*",
             fg_color=BG_INPUT, border_color=BORDER,
             text_color=TEXT_PRIMARY,
-            placeholder_text="xxx xxx xxx",
+            placeholder_text="ключ шифрования",
             placeholder_text_color=TEXT_HINT,
         )
-        self.remote_id_entry.pack(fill="x", padx=4, pady=(0, 4))
+        self.pw_entry.pack(side="left", padx=(8, 0))
 
-        ctk.CTkLabel(cid_inner,
-                     text="Введите ID удалённого ПК и пароль",
-                     font=ctk.CTkFont(size=11), text_color=TEXT_HINT,
-                     wraplength=380, justify="left").pack(anchor="w", padx=4, pady=(4, 0))
-
-    def _copy_host_id(self):
-        """Copy host ID to clipboard."""
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.host_id)
-        self._set_status("connected", "ID скопирован в буфер обмена")
-        self.root.after(2000, lambda: self._set_status("idle", "Готов к подключению"))
-
-    def _build_fields_section(self):
-        """Address and password fields."""
-        self.fields_card = self._card(self.main_frame, pad_top=8)
-
-        # Address row
-        self.addr_lbl = ctk.CTkLabel(self.fields_card, text="Адрес relay:",
-                                     font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY)
-        self.addr_lbl.pack(anchor="w", padx=4, pady=(0, 2))
-        self.addr_entry = ctk.CTkEntry(self.fields_card, textvariable=self.address,
-                                       height=36, corner_radius=8,
-                                       fg_color=BG_INPUT, border_color=BORDER,
-                                       text_color=TEXT_PRIMARY,
-                                       placeholder_text="IP:порт",
-                                       placeholder_text_color=TEXT_HINT)
-        self.addr_entry.pack(fill="x", padx=4, pady=(0, 8))
-
-        # Password row
-        pw_label_frame = ctk.CTkFrame(self.fields_card, fg_color="transparent")
-        pw_label_frame.pack(fill="x", padx=4, pady=(0, 2))
-        ctk.CTkLabel(pw_label_frame, text="Пароль:", font=ctk.CTkFont(size=12),
-                     text_color=TEXT_SECONDARY).pack(side="left")
-
-        pw_frame = ctk.CTkFrame(self.fields_card, fg_color="transparent")
-        pw_frame.pack(fill="x", padx=4, pady=(0, 8))
-        self.pw_entry = ctk.CTkEntry(pw_frame, textvariable=self.password,
-                                     height=36, corner_radius=8, show="*",
-                                     fg_color=BG_INPUT, border_color=BORDER,
-                                     text_color=TEXT_PRIMARY,
-                                     placeholder_text="ключ шифрования",
-                                     placeholder_text_color=TEXT_HINT)
-        self.pw_entry.pack(side="left", fill="x", expand=True)
-        self.pw_toggle_btn = ctk.CTkButton(pw_frame, text="👁", width=36, height=36,
-                                           corner_radius=8,
-                                           fg_color=BG_INPUT, hover_color=BORDER,
-                                           text_color=TEXT_SECONDARY,
-                                           command=self._toggle_pw)
-        self.pw_toggle_btn.pack(side="left", padx=(6, 0))
-
-        # Hint label
-        self.hint = ctk.CTkLabel(self.fields_card, text="", font=ctk.CTkFont(size=11),
-                                 text_color=TEXT_HINT, wraplength=380, justify="left")
-        self.hint.pack(anchor="w", padx=4, pady=(0, 2))
-
-    def _build_host_settings(self):
-        """Host-only settings: downloads dir, quality, fps, scale, codec, engine."""
-        # Outer wrapper — used for pack/pack_forget visibility toggling.
-        self.host_wrapper = ctk.CTkFrame(self.main_frame, fg_color="transparent",
-                                         corner_radius=0)
-        self.host_wrapper.pack(fill="x", padx=0, pady=0)
-
-        # Card frame styled like the other sections.
-        self.host_card_outer = ctk.CTkFrame(self.host_wrapper, fg_color=BG_CARD,
-                                            corner_radius=12, border_width=1,
-                                            border_color=BORDER)
-        self.host_card_outer.pack(fill="x", padx=24, pady=(8, 0))
-
-        # Section title
-        ctk.CTkLabel(self.host_card_outer, text="Настройки хоста",
-                     font=ctk.CTkFont(size=13, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(anchor="w", padx=16, pady=(14, 0))
-
-        # Inner content area
-        self.host_card = ctk.CTkFrame(self.host_card_outer, fg_color="transparent")
-        self.host_card.pack(fill="x", padx=16, pady=(8, 14))
-
-        # Downloads dir
-        dl_row = ctk.CTkFrame(self.host_card, fg_color="transparent")
-        dl_row.pack(fill="x", padx=4, pady=(0, 8))
-        ctk.CTkLabel(dl_row, text="Файлы в:", font=ctk.CTkFont(size=12),
-                     text_color=TEXT_SECONDARY, width=80).pack(side="left")
-        self.dl_entry = ctk.CTkEntry(dl_row, textvariable=self.downloads,
-                                     height=32, corner_radius=8,
-                                     fg_color=BG_INPUT, border_color=BORDER,
-                                     text_color=TEXT_PRIMARY)
-        self.dl_entry.pack(side="left", fill="x", expand=True, padx=(4, 4))
-        ctk.CTkButton(dl_row, text="...", width=36, height=32, corner_radius=8,
-                      fg_color=BG_INPUT, hover_color=BORDER,
-                      text_color=TEXT_SECONDARY,
-                      command=self._pick_dir).pack(side="left")
-
-        # Settings grid: quality, fps, scale in one row
-        grid1 = ctk.CTkFrame(self.host_card, fg_color="transparent")
-        grid1.pack(fill="x", padx=4, pady=(0, 6))
-        for i in range(6):
-            grid1.columnconfigure(i, weight=1 if i % 2 == 1 else 0)
-
-        self._grid_label(grid1, "Чёткость", 0, 0)
-        self.quality_cb = ctk.CTkComboBox(grid1, variable=self.quality, width=80,
-                                          values=["50", "60", "70", "80", "90"],
-                                          state="readonly", height=30, corner_radius=8,
-                                          fg_color=BG_INPUT, border_color=BORDER,
-                                          button_color=BORDER, button_hover_color=ACCENT,
-                                          dropdown_fg_color=BG_CARD,
-                                          dropdown_hover_color=ACCENT,
-                                          dropdown_text_color=TEXT_PRIMARY,
-                                          text_color=TEXT_PRIMARY)
-        self.quality_cb.grid(row=0, column=1, padx=(2, 10), sticky="w")
-
-        self._grid_label(grid1, "FPS", 0, 2)
-        self.fps_cb = ctk.CTkComboBox(grid1, variable=self.fps, width=80,
-                                      values=["15", "20", "25", "30", "40", "60"],
-                                      state="readonly", height=30, corner_radius=8,
-                                      fg_color=BG_INPUT, border_color=BORDER,
-                                      button_color=BORDER, button_hover_color=ACCENT,
-                                      dropdown_fg_color=BG_CARD,
-                                      dropdown_hover_color=ACCENT,
-                                      dropdown_text_color=TEXT_PRIMARY,
-                                      text_color=TEXT_PRIMARY)
-        self.fps_cb.grid(row=0, column=3, padx=(2, 10), sticky="w")
-
-        self._grid_label(grid1, "Масштаб", 0, 4)
-        self.scale_cb = ctk.CTkComboBox(grid1, variable=self.scale, width=80,
-                                        values=["100%", "75%", "50%"],
-                                        state="readonly", height=30, corner_radius=8,
-                                        fg_color=BG_INPUT, border_color=BORDER,
-                                        button_color=BORDER, button_hover_color=ACCENT,
-                                        dropdown_fg_color=BG_CARD,
-                                        dropdown_hover_color=ACCENT,
-                                        dropdown_text_color=TEXT_PRIMARY,
-                                        text_color=TEXT_PRIMARY)
-        self.scale_cb.grid(row=0, column=5, padx=2, sticky="w")
-
-        # Codec + engine row
-        grid2 = ctk.CTkFrame(self.host_card, fg_color="transparent")
-        grid2.pack(fill="x", padx=4, pady=(0, 4))
-
-        self._grid_label(grid2, "Формат", 0, 0)
-        self.codec_cb = ctk.CTkComboBox(grid2, variable=self.codec, width=90,
-                                        values=["Авто", "JPEG", "PNG"],
-                                        state="readonly", height=30, corner_radius=8,
-                                        fg_color=BG_INPUT, border_color=BORDER,
-                                        button_color=BORDER, button_hover_color=ACCENT,
-                                        dropdown_fg_color=BG_CARD,
-                                        dropdown_hover_color=ACCENT,
-                                        dropdown_text_color=TEXT_PRIMARY,
-                                        text_color=TEXT_PRIMARY)
-        self.codec_cb.grid(row=0, column=1, padx=(2, 10), sticky="w")
-
-        self._grid_label(grid2, "Движок", 0, 2)
-        self.engine_cb = ctk.CTkComboBox(grid2, variable=self.engine, width=180,
-                                         values=["Видео H.264", "Плитки (совместимость)"],
-                                         state="readonly", height=30, corner_radius=8,
-                                         fg_color=BG_INPUT, border_color=BORDER,
-                                         button_color=BORDER, button_hover_color=ACCENT,
-                                         dropdown_fg_color=BG_CARD,
-                                         dropdown_hover_color=ACCENT,
-                                         dropdown_text_color=TEXT_PRIMARY,
-                                         text_color=TEXT_PRIMARY)
-        self.engine_cb.grid(row=0, column=3, padx=2, sticky="w")
-
-        # Info hints
-        ctk.CTkLabel(self.host_card, text="PNG — без потерь (текст идеален) | "
-                     "H.264 — быстрее и легче по сети",
-                     font=ctk.CTkFont(size=11), text_color=TEXT_HINT).pack(
-                     anchor="w", padx=8, pady=(4, 0))
-
-    def _build_start_button(self):
-        """Big prominent Connect / Start Host button."""
-        self.btn_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.btn_frame.pack(fill="x", padx=24, pady=(12, 4))
-
-        self.start_btn = ctk.CTkButton(
-            self.btn_frame,
-            text="Запустить",
-            height=46,
-            corner_radius=10,
-            font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color=ACCENT,
-            hover_color=ACCENT_HOVER,
-            text_color="#ffffff",
-            command=self._start,
+        self.pw_toggle_btn = ctk.CTkButton(
+            pw_row, text="\U0001f441", width=30, height=30,
+            corner_radius=6, fg_color=BG_INPUT, hover_color=BORDER,
+            text_color=TEXT_SECONDARY, command=self._toggle_pw,
         )
-        self.start_btn.pack(fill="x")
+        self.pw_toggle_btn.pack(side="left", padx=(4, 0))
+
+        # Relay address (small)
+        addr_row = ctk.CTkFrame(inner, fg_color="transparent")
+        addr_row.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(addr_row, text="Relay:",
+                     font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY).pack(side="left")
+
+        self.addr_entry = ctk.CTkEntry(
+            addr_row, textvariable=self.address,
+            height=30, width=200, corner_radius=6,
+            fg_color=BG_INPUT, border_color=BORDER,
+            text_color=TEXT_PRIMARY,
+            placeholder_text="IP:порт",
+            placeholder_text_color=TEXT_HINT,
+        )
+        self.addr_entry.pack(side="left", padx=(8, 0))
+
+    def _build_tab_bar(self):
+        """Tab bar: Недавние Сеансы | Избранное | Обнаруженные."""
+        self.tab_bar = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.tab_bar.pack(fill="x", padx=24, pady=(16, 0))
+
+        sep = ctk.CTkFrame(self.tab_bar, fg_color=BORDER, height=1)
+        sep.pack(fill="x", pady=(0, 0))
+
+        btn_row = ctk.CTkFrame(self.tab_bar, fg_color="transparent")
+        btn_row.pack(fill="x")
+
+        self._tab_buttons = {}
+        tabs = [
+            ("recent", "Недавние Сеансы"),
+            ("favorites", "Избранное"),
+            ("discovered", "Обнаруженные"),
+        ]
+        for key, label in tabs:
+            btn = ctk.CTkButton(
+                btn_row, text=label, height=34,
+                corner_radius=0, font=ctk.CTkFont(size=13),
+                fg_color="transparent", hover_color=BG_CARD,
+                text_color=TEXT_HINT,
+                command=lambda k=key: self._switch_tab(k),
+            )
+            btn.pack(side="left", padx=(0, 2))
+            self._tab_buttons[key] = btn
+
+    def _build_tab_content(self):
+        """Scrollable area for session/device cards."""
+        self.tab_content = ctk.CTkScrollableFrame(
+            self.main_frame, fg_color="transparent",
+            corner_radius=0,
+        )
+        self.tab_content.pack(fill="both", expand=True, padx=24, pady=(8, 0))
 
     def _build_footer(self):
         """Footer with status indicator and version."""
         self.footer_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.footer_frame.pack(fill="x", padx=24, pady=(4, 16))
+        self.footer_frame.pack(fill="x", padx=24, pady=(4, 12))
 
-        # Status dot + text
         status_row = ctk.CTkFrame(self.footer_frame, fg_color="transparent")
         status_row.pack(side="left")
 
@@ -500,91 +411,317 @@ class LauncherUI:
         ctk.CTkLabel(self.footer_frame, text="v1.0", font=ctk.CTkFont(size=11),
                      text_color=TEXT_HINT).pack(side="right")
 
-    # ======== Helpers ========
+    # ================================================================
+    #  TAB SWITCHING & CONTENT
+    # ================================================================
 
-    def _card(self, parent, pad_top=8):
-        """Create a card-style frame with subtle background."""
-        card = ctk.CTkFrame(parent, fg_color=BG_CARD, corner_radius=12,
-                            border_width=1, border_color=BORDER)
-        card.pack(fill="x", padx=24, pady=(pad_top, 0))
+    def _switch_tab(self, key):
+        self._active_tab.set(key)
+        # Update button styles
+        for k, btn in self._tab_buttons.items():
+            if k == key:
+                btn.configure(text_color=ACCENT, fg_color=BG_CARD)
+            else:
+                btn.configure(text_color=TEXT_HINT, fg_color="transparent")
+        # Clear content
+        for w in self.tab_content.winfo_children():
+            w.destroy()
+        # Populate
+        if key == "recent":
+            self._populate_recent()
+        elif key == "favorites":
+            self._populate_favorites()
+        elif key == "discovered":
+            self._populate_discovered()
+
+    def _populate_recent(self):
+        if session_history is None:
+            self._empty_placeholder("Модуль истории сеансов не установлен")
+            return
+        try:
+            sessions = session_history.get_recent()
+        except Exception:
+            sessions = []
+        if not sessions:
+            self._empty_placeholder("Нет недавних сеансов")
+            return
+        for s in sessions:
+            self._session_card(s)
+
+    def _populate_favorites(self):
+        if session_history is None:
+            self._empty_placeholder("Модуль истории сеансов не установлен")
+            return
+        try:
+            sessions = session_history.get_favorites()
+        except Exception:
+            sessions = []
+        if not sessions:
+            self._empty_placeholder("Нет избранных")
+            return
+        for s in sessions:
+            self._session_card(s)
+
+    def _populate_discovered(self):
+        if lan_discovery is None:
+            self._empty_placeholder("Модуль обнаружения не установлен")
+            return
+        try:
+            devices = lan_discovery.get_discovered()
+        except Exception:
+            devices = []
+        if not devices:
+            self._empty_placeholder("Устройства не найдены")
+            return
+        for d in devices:
+            self._device_card(d)
+
+    def _empty_placeholder(self, text):
+        ctk.CTkLabel(self.tab_content, text=text,
+                     font=ctk.CTkFont(size=13), text_color=TEXT_HINT).pack(
+                     anchor="center", pady=30)
+
+    def _session_card(self, session):
+        """Render a session card: name, ID, OS, favorite star, online dot."""
+        card = ctk.CTkFrame(self.tab_content, fg_color=BG_CARD, corner_radius=10,
+                            border_width=1, border_color=BORDER, height=60)
+        card.pack(fill="x", pady=(0, 6))
+        card.pack_propagate(False)
+
         inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(fill="x", padx=16, pady=14)
-        return inner
+        inner.pack(fill="x", padx=12, pady=10)
 
-    def _grid_label(self, parent, text, row, col):
-        lbl = ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=12),
-                           text_color=TEXT_SECONDARY)
-        lbl.grid(row=row, column=col, padx=(0, 4), sticky="w")
-        return lbl
+        # Online dot
+        is_online = getattr(session, "is_online", False)
+        dot_color = GREEN if is_online else TEXT_HINT
+        ctk.CTkLabel(inner, text="⬤", font=ctk.CTkFont(size=8),
+                     text_color=dot_color, width=14).pack(side="left")
 
-    def _set_status(self, state="idle", text=None):
-        """Update the status indicator: idle, connected, error."""
-        colors = {"idle": TEXT_HINT, "connected": GREEN, "error": RED, "waiting": YELLOW}
-        self.status_dot.configure(text_color=colors.get(state, TEXT_HINT))
-        if text:
-            self.status_text.configure(text=text)
+        # Name + ID
+        info = ctk.CTkFrame(inner, fg_color="transparent")
+        info.pack(side="left", padx=(6, 0))
 
-    # ---- Динамика формы ----
+        name = getattr(session, "name", "") or "Unknown"
+        ctk.CTkLabel(info, text=name, font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=TEXT_PRIMARY).pack(anchor="w")
+
+        sid = getattr(session, "id", "")
+        os_label = getattr(session, "os", "")
+        sub = _format_id(str(sid)) if sid else ""
+        if os_label:
+            sub += f"  ·  {os_label}"
+        ctk.CTkLabel(info, text=sub, font=ctk.CTkFont(size=11),
+                     text_color=TEXT_SECONDARY).pack(anchor="w")
+
+        # Favorite star
+        is_fav = getattr(session, "is_favorite", False)
+        star = "★" if is_fav else "☆"
+        star_color = YELLOW if is_fav else TEXT_HINT
+        ctk.CTkLabel(inner, text=star, font=ctk.CTkFont(size=16),
+                     text_color=star_color, width=20).pack(side="right")
+
+        # Click to connect
+        card.bind("<Button-1>", lambda e, s=session: self._connect_to_session(s))
+        for child in inner.winfo_children():
+            child.bind("<Button-1>", lambda e, s=session: self._connect_to_session(s))
+
+    def _device_card(self, device):
+        """Render a discovered LAN device card."""
+        card = ctk.CTkFrame(self.tab_content, fg_color=BG_CARD, corner_radius=10,
+                            border_width=1, border_color=BORDER, height=60)
+        card.pack(fill="x", pady=(0, 6))
+        card.pack_propagate(False)
+
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=12, pady=10)
+
+        is_online = getattr(device, "is_online", False)
+        dot_color = GREEN if is_online else TEXT_HINT
+        ctk.CTkLabel(inner, text="⬤", font=ctk.CTkFont(size=8),
+                     text_color=dot_color, width=14).pack(side="left")
+
+        info = ctk.CTkFrame(inner, fg_color="transparent")
+        info.pack(side="left", padx=(6, 0))
+
+        name = getattr(device, "name", "") or getattr(device, "ip", "Unknown")
+        ctk.CTkLabel(info, text=name, font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=TEXT_PRIMARY).pack(anchor="w")
+
+        did = getattr(device, "id", "")
+        os_label = getattr(device, "os", "")
+        ip = getattr(device, "ip", "")
+        sub_parts = []
+        if did:
+            sub_parts.append(_format_id(str(did)))
+        if os_label:
+            sub_parts.append(os_label)
+        if ip:
+            sub_parts.append(ip)
+        ctk.CTkLabel(info, text="  ·  ".join(sub_parts),
+                     font=ctk.CTkFont(size=11),
+                     text_color=TEXT_SECONDARY).pack(anchor="w")
+
+        card.bind("<Button-1>", lambda e, d=device: self._connect_to_device(d))
+
+    # ================================================================
+    #  ACTIONS
+    # ================================================================
+
+    def _copy_host_id(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.host_id)
+        self._set_status("connected", "ИД скопирован в буфер обмена")
+        self.root.after(2000, lambda: self._set_status("idle", "Готов к подключению"))
+
     def _toggle_pw(self):
         self._show_pw.set(not self._show_pw.get())
         self.pw_entry.configure(show="" if self._show_pw.get() else "*")
 
-    def _pick_dir(self):
-        d = filedialog.askdirectory(initialdir=self.downloads.get() or os.path.expanduser("~"))
-        if d:
-            self.downloads.set(d)
+    def _on_update(self):
+        if updater is not None:
+            try:
+                updater.check_and_update()
+            except Exception as e:
+                messagebox.showerror("Обновление", str(e), parent=self.root)
 
-    def _refresh(self):
-        is_host = self.role.get() == "host"
-        is_relay = self.conn.get() == "relay"
-
-        # ID cards visibility — unpack all, then re-pack in order
-        self.host_id_wrapper.pack_forget()
-        self.client_id_wrapper.pack_forget()
-
-        # Host settings scrollable section visibility.
-        # Re-pack bottom elements to maintain correct order after show/hide.
-        self.host_wrapper.pack_forget()
-        self.btn_frame.pack_forget()
-        self.footer_frame.pack_forget()
-
-        # Show appropriate ID card for relay mode
-        if is_relay and is_host:
-            self.host_id_wrapper.pack(fill="x", padx=0, pady=0, before=self.fields_card.master)
-        elif is_relay and not is_host:
-            self.client_id_wrapper.pack(fill="x", padx=0, pady=0, before=self.fields_card.master)
-
-        if is_host:
-            self.host_wrapper.pack(fill="x", padx=0, pady=0)
-
-        self.btn_frame.pack(fill="x", padx=24, pady=(12, 4))
-        self.footer_frame.pack(fill="x", padx=24, pady=(4, 16))
-
-        # Address label text
-        if is_relay:
-            self.addr_lbl.configure(text="Адрес relay:")
-            self.address_hint = "IP:порт вашего relay-сервера, напр. 203.0.113.5:5800"
-        elif is_host:
-            self.addr_lbl.configure(text="Слушать порт:")
-            self.address_hint = "Порт, напр. 5900 (нужен проброс/туннель к этому ПК)"
+    def _on_host_toggle(self):
+        hosting = self.host_switch.get()  # 1 or 0
+        self._hosting.set(bool(hosting))
+        if hosting:
+            self._start_hosting()
         else:
-            self.addr_lbl.configure(text="Адрес ПК:")
-            self.address_hint = "IP:порт удалённого ПК, напр. 100.x.y.z:5900"
+            self._stop_hosting()
 
-        # Start button text
-        self.start_btn.configure(text="Запустить хост" if is_host else "Подключиться")
+    def _start_hosting(self):
+        """Start host in background thread."""
+        try:
+            args = self._build_host_args()
+        except ValueError as e:
+            messagebox.showwarning("Проверьте поля", str(e))
+            self.host_switch.deselect()
+            self._hosting.set(False)
+            return
+        self._persist()
+        self._set_status("waiting", "Хост запущен, ожидание…")
+        self._host_stop_event = threading.Event()
+        host.LOG = lambda *a: self.root.after(0, self._host_log, " ".join(str(x) for x in a))
+        threading.Thread(target=host.run_host, args=(args, self._host_stop_event),
+                         daemon=True).start()
 
-        # Hints
-        hints = [self.address_hint]
-        if is_relay and is_host:
-            hints.append("Сообщите этот ID и пароль для подключения к вашему ПК")
-        elif is_relay and not is_host:
-            hints.append("Введите ID удалённого ПК и пароль")
-        hints.append("Пароль одинаковый на обоих ПК — это ключ шифрования.")
-        self.hint.configure(text="  •  " + "\n  •  ".join(hints))
+    def _stop_hosting(self):
+        if hasattr(self, "_host_stop_event"):
+            self._host_stop_event.set()
+        self._set_status("idle", "Готов к подключению")
 
-    # ---- Сборка Args из формы ----
+    def _host_log(self, msg):
+        """Handle host log messages while in launcher view."""
+        # Could show in status bar or a small log panel; for now update status
+        self._set_status("connected", msg[:60])
+
+    def _on_connect(self):
+        """Connect button in the top bar address field."""
+        remote = self.remote_id.get().replace(" ", "").strip()
+        if not remote:
+            messagebox.showwarning("Подключение",
+                                   "Введите ID удалённого ПК.")
+            return
+        self._do_client_connect(remote)
+
+    def _connect_to_session(self, session):
+        sid = str(getattr(session, "id", ""))
+        if sid:
+            self.remote_id.set(_format_id(sid))
+            self._do_client_connect(sid)
+
+    def _connect_to_device(self, device):
+        did = str(getattr(device, "id", ""))
+        ip = getattr(device, "ip", "")
+        port = getattr(device, "port", "")
+        if did:
+            self.remote_id.set(_format_id(did))
+            self._do_client_connect(did)
+        elif ip:
+            addr = f"{ip}:{port}" if port else ip
+            self.remote_id.set(addr)
+            self._do_direct_connect(addr)
+
+    def _do_client_connect(self, remote_id):
+        """Connect to a remote host via relay using its 9-digit ID."""
+        remote = remote_id.replace(" ", "").strip()
+        if not remote.isdigit() or len(remote) != 9:
+            messagebox.showwarning("Подключение",
+                                   "ID должен состоять из 9 цифр.")
+            return
+        addr = self.address.get().strip()
+        pw = self.password.get()
+        if not addr:
+            messagebox.showwarning("Подключение",
+                                   "Укажите адрес relay.")
+            return
+        if not pw:
+            messagebox.showwarning("Подключение",
+                                   "Укажите пароль.")
+            return
+        self._persist()
+        args = Args(password=pw, relay=addr, unique_id=remote)
+        self._set_status("waiting", "Подключение…")
+        self.root.withdraw()
+        try:
+            client.run_client(args)
+        except Exception as e:
+            self.root.deiconify()
+            messagebox.showerror("Ошибка подключения", str(e), parent=self.root)
+            self._set_status("error", str(e)[:60])
+            return
+        self.root.destroy()
+
+    def _do_direct_connect(self, addr):
+        """Connect directly to IP:port."""
+        pw = self.password.get()
+        if not pw:
+            messagebox.showwarning("Подключение",
+                                   "Укажите пароль.")
+            return
+        self._persist()
+        args = Args(password=pw, connect=addr)
+        self._set_status("waiting", "Подключение…")
+        self.root.withdraw()
+        try:
+            client.run_client(args)
+        except Exception as e:
+            self.root.deiconify()
+            messagebox.showerror("Ошибка подключения", str(e), parent=self.root)
+            self._set_status("error", str(e)[:60])
+            return
+        self.root.destroy()
+
+    # ================================================================
+    #  ARGS BUILDING
+    # ================================================================
+
+    def _build_host_args(self):
+        """Build Args for hosting mode."""
+        addr = self.address.get().strip()
+        pw = self.password.get()
+        if not addr:
+            raise ValueError("Укажите адрес relay.")
+        if not pw:
+            raise ValueError("Укажите пароль.")
+        cfg = load_config()
+        a = Args(password=pw, id="default")
+        a.downloads = self.downloads.get().strip() or DEFAULT_DOWNLOADS
+        a.quality = int(self.quality.get())
+        a.fps = int(self.fps.get())
+        a.scale = {"100%": 1.0, "75%": 0.75, "50%": 0.5}.get(self.scale.get(), 1.0)
+        a.codec = {"Авто": "auto", "JPEG": "jpeg", "PNG": "png"}.get(self.codec.get(), "auto")
+        a.engine = {"Видео H.264": "auto",
+                    "Плитки (совместимость)": "tiles"}.get(self.engine.get(), "auto")
+        a.relay = addr
+        a.unique_id = self.host_id
+        return a
+
     def _build_args(self):
+        """Legacy _build_args for compatibility."""
         role = self.role.get()
         is_relay = self.conn.get() == "relay"
         addr = self.address.get().strip()
@@ -607,7 +744,7 @@ class LauncherUI:
                 a.relay = addr
                 a.unique_id = self.host_id
             else:
-                a.listen = int(addr)            # тут addr = порт
+                a.listen = int(addr)
         else:
             if is_relay:
                 a.relay = addr
@@ -628,9 +765,18 @@ class LauncherUI:
             "password": self.password.get(), "downloads": self.downloads.get(),
             "quality": self.quality.get(), "fps": self.fps.get(), "scale": self.scale.get(),
             "codec": self.codec.get(), "engine": self.engine.get(),
+            "hosting": self._hosting.get(),
         })
 
-    # ---- Запуск ----
+    def _pick_dir(self):
+        d = filedialog.askdirectory(initialdir=self.downloads.get() or os.path.expanduser("~"))
+        if d:
+            self.downloads.set(d)
+
+    # ================================================================
+    #  START (legacy — kept for host window mode)
+    # ================================================================
+
     def _start(self):
         try:
             role, args = self._build_args()
@@ -638,6 +784,7 @@ class LauncherUI:
             messagebox.showwarning("Проверьте поля", str(e))
             return
         self._persist()
+        self._set_status("waiting", "Подключение…")
 
         if role == "host":
             self._run_host_window(args)
@@ -652,8 +799,7 @@ class LauncherUI:
             self.root.destroy()
 
     def _run_host_window(self, args):
-        """Прячем форму, показываем окно-лог хоста (dark-themed)."""
-        # Clear main frame
+        """Hide launcher, show host log window (dark-themed)."""
         self.main_frame.destroy()
         self.root.title("RemoteDesktop — хост")
         self.root.resizable(True, True)
@@ -663,7 +809,6 @@ class LauncherUI:
         container = ctk.CTkFrame(self.root, fg_color=BG_DARK, corner_radius=0)
         container.pack(fill="both", expand=True, padx=0, pady=0)
 
-        # Header
         header = ctk.CTkFrame(container, fg_color=BG_CARD, corner_radius=0, height=56)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -671,7 +816,6 @@ class LauncherUI:
         header_inner = ctk.CTkFrame(header, fg_color="transparent")
         header_inner.pack(fill="x", padx=16, pady=0)
 
-        # Status dot in header
         self.host_status_dot = ctk.CTkLabel(header_inner, text="⬤",
                                             font=ctk.CTkFont(size=12),
                                             text_color=YELLOW, width=20)
@@ -682,7 +826,6 @@ class LauncherUI:
                                             text_color=TEXT_PRIMARY)
         self.host_status_lbl.pack(side="left", padx=(6, 0), pady=16)
 
-        # Log area
         log_frame = ctk.CTkFrame(container, fg_color=BG_CARD, corner_radius=12,
                                  border_width=1, border_color=BORDER)
         log_frame.pack(fill="both", expand=True, padx=16, pady=(12, 8))
@@ -699,7 +842,6 @@ class LauncherUI:
         scrollbar.pack(side="right", fill="y", padx=(0, 4), pady=4)
         self.log_text.configure(yscrollcommand=scrollbar.set)
 
-        # Footer bar
         footer = ctk.CTkFrame(container, fg_color="transparent")
         footer.pack(fill="x", padx=16, pady=(0, 12))
 
@@ -721,7 +863,6 @@ class LauncherUI:
             self.log_text.see("end")
             self.log_text.config(state="disabled")
 
-        # host.LOG вызывается из рабочего потока -> обновляем UI через after()
         host.LOG = lambda *a: self.root.after(0, append, " ".join(str(x) for x in a))
 
         stop_event = threading.Event()
@@ -732,10 +873,33 @@ class LauncherUI:
             self.root.destroy()
         self.root.protocol("WM_DELETE_WINDOW", on_close)
 
+    # ================================================================
+    #  STATUS BAR
+    # ================================================================
+
+    def _set_status(self, state="idle", text=None):
+        colors = {"idle": TEXT_HINT, "connected": GREEN, "error": RED, "waiting": YELLOW}
+        if self._status_pulse_id:
+            self.root.after_cancel(self._status_pulse_id)
+            self._status_pulse_id = None
+        self.status_dot.configure(text_color=colors.get(state, TEXT_HINT))
+        if text:
+            self.status_text.configure(text=text)
+        if state == "waiting":
+            self._pulse_status(YELLOW, 0)
+
+    def _pulse_status(self, color, step):
+        import math
+        alpha = 0.4 + 0.6 * abs(math.sin(step * 0.08))
+        c = _lerp_color(BG_DARK, color, alpha)
+        try:
+            self.status_dot.configure(text_color=c)
+        except Exception:
+            return
+        self._status_pulse_id = self.root.after(40, self._pulse_status, color, step + 1)
+
 
 def _setup_logging():
-    """В собранном --windowed exe stdout=None. Перенаправляем вывод и
-    необработанные ошибки в лог-файл, чтобы окно не закрывалось «молча»."""
     if not getattr(sys, "frozen", False):
         return
     try:
@@ -761,9 +925,18 @@ def main():
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     root = ctk.CTk()
-    root.geometry("500x850")
+    root.geometry("540x700")
+    root.attributes("-alpha", 0.0)
     LauncherUI(root)
+    _fade_in(root, 0.0)
     root.mainloop()
+
+
+def _fade_in(root, alpha):
+    alpha = min(alpha + 0.06, 1.0)
+    root.attributes("-alpha", alpha)
+    if alpha < 1.0:
+        root.after(16, _fade_in, root, alpha)
 
 
 if __name__ == "__main__":

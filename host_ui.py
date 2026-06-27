@@ -230,6 +230,26 @@ class HostWindow:
             command=self._on_close,
         ).pack(side="right", padx=12, pady=7)
 
+        ctk.CTkButton(
+            bottom, text="Свернуть",
+            fg_color="#334155", hover_color="#475569",
+            text_color="white",
+            font=ctk.CTkFont(size=12),
+            width=100, height=30,
+            corner_radius=6,
+            command=self.app.iconify,
+        ).pack(side="right", padx=(0, 4), pady=7)
+
+        ctk.CTkButton(
+            bottom, text="Свернуть в трей",
+            fg_color="#334155", hover_color="#475569",
+            text_color="white",
+            font=ctk.CTkFont(size=12),
+            width=130, height=30,
+            corner_radius=6,
+            command=self._minimize_to_tray,
+        ).pack(side="right", padx=(0, 4), pady=7)
+
     # ── Host thread ─────────────────────────────────────────────────
     def _start_host_thread(self):
         host.LOG = self._log_callback

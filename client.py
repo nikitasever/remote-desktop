@@ -103,7 +103,13 @@ def reader_thread(sock, chan, state, clip, sender=None):
     incoming_file = {"f": None, "name": None}
     try:
         while state.alive:
-            mt, body = common.recv_frame(sock, chan)
+            try:
+                mt, body = common.recv_frame(sock, chan)
+            except (ConnectionError, socket.error):
+                raise
+            except Exception as e:
+                print(f"[client] ошибка чтения кадра: {e}")
+                continue
             if mt == common.MSG_SCREEN_INFO:
                 info = common.parse_json(body)
                 with state.lock:
@@ -174,11 +180,15 @@ def reader_thread(sock, chan, state, clip, sender=None):
             elif mt == common.MSG_HOST_FILE_CHUNK:
                 if incoming_file["f"]:
                     incoming_file["f"].write(body)
+                else:
+                    print(f"[client] FILE_CHUNK без открытого файла, {len(body)} байт потеряно")
             elif mt == common.MSG_HOST_FILE_END:
                 if incoming_file["f"]:
                     incoming_file["f"].close()
                     print(f"[client] файл от host сохранён: {incoming_file['name']}")
                     incoming_file["f"] = None
+                else:
+                    print("[client] FILE_END без открытого файла")
             elif mt == common.MSG_DIR_LIST_RESP:
                 resp = common.parse_json(body)
                 with state.lock:
@@ -194,10 +204,16 @@ def reader_thread(sock, chan, state, clip, sender=None):
                         print(f"  {kind} {e['name']}" + (f"  ({sz} B)" if not e.get("is_dir") else ""))
     except (ConnectionError, socket.error) as e:
         print(f"[client] соединение закрыто: {e}")
+    except Exception as e:
+        print(f"[client] reader_thread неожиданная ошибка: {e}")
+        import traceback; traceback.print_exc()
     finally:
         state.alive = False
         if incoming_file["f"]:
-            incoming_file["f"].close()
+            try:
+                incoming_file["f"].close()
+            except OSError:
+                pass
 
 
 def apply_tiles(body, state):
@@ -217,6 +233,36 @@ def apply_tiles(body, state):
             surf.blit(tile_surf, (x, y))
 
 
+def send_file_by_path(sender, state, path):
+    """Отправляет файл по указанному пути на удалённый ПК (в фоновом потоке)."""
+    def worker():
+        try:
+            if not os.path.isfile(path):
+                print(f"[client] файл не найден: {path}")
+                return
+            size = os.path.getsize(path)
+            name = os.path.basename(path)
+            sender.send_json(common.MSG_FILE_META, {"name": name, "size": size})
+            sent = 0
+            with open(path, "rb") as f:
+                while state.alive:
+                    chunk = f.read(256 * 1024)
+                    if not chunk:
+                        break
+                    sender.send(common.MSG_FILE_CHUNK, chunk)
+                    sent += len(chunk)
+            sender.send(common.MSG_FILE_END)
+            print(f"[client] отправлено {sent} байт: {name}")
+        except (ConnectionError, socket.error) as e:
+            print(f"[client] ошибка отправки файла (сеть): {e}")
+        except OSError as e:
+            print(f"[client] ошибка отправки файла (диск): {e}")
+        except Exception as e:
+            print(f"[client] ошибка отправки файла: {e}")
+            import traceback; traceback.print_exc()
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def send_file_dialog(sender, state):
     """Открывает диалог выбора файла и отправляет его на удалённый ПК."""
     def worker():
@@ -232,21 +278,7 @@ def send_file_dialog(sender, state):
             return
         if not path:
             return
-        try:
-            size = os.path.getsize(path)
-            sender.send_json(common.MSG_FILE_META, {"name": os.path.basename(path), "size": size})
-            sent = 0
-            with open(path, "rb") as f:
-                while state.alive:
-                    chunk = f.read(256 * 1024)
-                    if not chunk:
-                        break
-                    sender.send(common.MSG_FILE_CHUNK, chunk)
-                    sent += len(chunk)
-            sender.send(common.MSG_FILE_END)
-            print(f"[client] отправлено {sent} байт: {os.path.basename(path)}")
-        except (ConnectionError, socket.error, OSError) as e:
-            print(f"[client] ошибка отправки файла: {e}")
+        send_file_by_path(sender, state, path)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -550,15 +582,17 @@ def run_ui(sender, state, clip):
 
     # Toolbar state
     toolbar_visible = False
-    toolbar_alpha = 0          # 0..255 for fade animation
-    toolbar_last_hover = 0.0   # timestamp of last hover in toolbar zone
-    toolbar_hovered = False    # mouse is in toolbar area right now
+    toolbar_alpha = 0
+    toolbar_y_offset = float(-TOOLBAR_H)
+    toolbar_last_hover = 0.0
+    toolbar_hovered = False
 
     threading.Thread(target=ping_loop, args=(sender, state), daemon=True).start()
     last_stat = time.time()
 
     # Ждём первый кадр, НО продолжаем качать события и рисовать статус —
     # иначе Windows помечает окно «Не отвечает» и оно остаётся чёрным.
+    import math as _math
     splash = pygame.font.SysFont("Segoe UI", 22)
     splash_sm = pygame.font.SysFont("Consolas", 15)
     t_wait = time.time()
@@ -573,17 +607,32 @@ def run_ui(sender, state, clip):
             err = state.decode_err
         win.fill((17, 24, 39))
         ww, wh = win.get_size()
+
+        elapsed = time.time() - t_wait
+        cx, cy = ww // 2, wh // 2 - 50
+        for i in range(12):
+            angle = _math.radians(i * 30 - elapsed * 360)
+            alpha = int(80 + 175 * ((i / 12 + elapsed * 2) % 1.0))
+            alpha = min(255, alpha)
+            dx = int(_math.cos(angle) * 20)
+            dy = int(_math.sin(angle) * 20)
+            dot_surf = pygame.Surface((8, 8), pygame.SRCALPHA)
+            pygame.draw.circle(dot_surf, (100, 140, 220, alpha), (4, 4), 4)
+            win.blit(dot_surf, (cx + dx - 4, cy + dy - 4))
+
         msg = err or status
         color = (255, 110, 110) if err else (220, 220, 230)
         txt = splash.render(msg, True, color)
-        win.blit(txt, (ww // 2 - txt.get_width() // 2, wh // 2 - 20))
-        waited = int(time.time() - t_wait)
+        win.blit(txt, (ww // 2 - txt.get_width() // 2, wh // 2 + 10))
+        waited = int(elapsed)
         sub = splash_sm.render(f"ожидание: {waited}s   (Ctrl+Alt+Q — выход)", True, (130, 140, 160))
-        win.blit(sub, (ww // 2 - sub.get_width() // 2, wh // 2 + 18))
+        win.blit(sub, (ww // 2 - sub.get_width() // 2, wh // 2 + 48))
         pygame.display.flip()
         clock.tick(30)
     if not state.alive:
         return
+
+    fade_alpha = 0
 
     def send_input(ev):
         try:
@@ -620,7 +669,7 @@ def run_ui(sender, state, clip):
         # Track mouse for toolbar
         mouse_pos = pygame.mouse.get_pos()
         mouse_in_trigger = mouse_pos[1] <= TOOLBAR_TRIGGER_ZONE
-        mouse_in_toolbar = mouse_pos[1] <= TOOLBAR_H and toolbar_visible
+        mouse_in_toolbar = mouse_pos[1] <= TOOLBAR_H + int(toolbar_y_offset) and toolbar_visible
 
         if mouse_in_trigger or mouse_in_toolbar:
             toolbar_last_hover = now
@@ -628,12 +677,13 @@ def run_ui(sender, state, clip):
         else:
             toolbar_hovered = False
 
-        # Toolbar visibility: show if recently hovered, auto-hide after delay
         if toolbar_hovered or (now - toolbar_last_hover < TOOLBAR_AUTOHIDE_DELAY):
             toolbar_visible = True
             toolbar_alpha = min(toolbar_alpha + 30, TOOLBAR_ALPHA)
+            toolbar_y_offset = min(toolbar_y_offset + 4.0, 0.0)
         else:
             toolbar_alpha = max(toolbar_alpha - 15, 0)
+            toolbar_y_offset = max(toolbar_y_offset - 4.0, float(-TOOLBAR_H))
             if toolbar_alpha == 0:
                 toolbar_visible = False
 
@@ -651,13 +701,12 @@ def run_ui(sender, state, clip):
                     win = pygame.display.set_mode(event.size, pygame.RESIZABLE)
             elif event.type == pygame.MOUSEMOTION:
                 # Don't forward mouse to remote when in toolbar area
-                if not (toolbar_visible and event.pos[1] <= TOOLBAR_H):
+                if not (toolbar_visible and event.pos[1] <= TOOLBAR_H + int(toolbar_y_offset)):
                     x, y = to_norm(event.pos)
                     send_input({"k": "move", "x": x, "y": y})
             elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
-                # Toolbar button clicks
                 if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
-                        and toolbar_visible and event.pos[1] <= TOOLBAR_H):
+                        and toolbar_visible and event.pos[1] <= TOOLBAR_H + int(toolbar_y_offset)):
                     for btn in toolbar_buttons:
                         if btn.rect.collidepoint(event.pos):
                             btn.action()
@@ -719,6 +768,11 @@ def run_ui(sender, state, clip):
                         ident = {"name": PG_SPECIAL[event.key]}
                     if ident is not None:
                         send_input({"k": "kup", **ident})
+            elif event.type == getattr(pygame, "DROPFILE", -1):
+                dropped = getattr(event, "file", None)
+                if dropped and os.path.isfile(dropped):
+                    print(f"[client] drag-and-drop: отправка {dropped}")
+                    send_file_by_path(sender, state, dropped)
             elif event.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
                 release_all()
 
@@ -735,10 +789,19 @@ def run_ui(sender, state, clip):
         # --- Render ---
         with state.lock:
             if state.surface is not None:
-                if state.surface.get_size() == win.get_size():
-                    win.blit(state.surface, (0, 0))
+                wsize = win.get_size()
+                if state.surface.get_size() == wsize:
+                    frame = state.surface
                 else:
-                    win.blit(pygame.transform.smoothscale(state.surface, win.get_size()), (0, 0))
+                    frame = pygame.transform.smoothscale(state.surface, wsize)
+                if fade_alpha < 255:
+                    win.fill((17, 24, 39))
+                    frame.set_alpha(fade_alpha)
+                    win.blit(frame, (0, 0))
+                    frame.set_alpha(255)
+                    fade_alpha = min(fade_alpha + 18, 255)
+                else:
+                    win.blit(frame, (0, 0))
             show = state.show_stats
             fps, kbps, rtt = state.fps, state.kbps, state.rtt_ms
             rtt_age = now - state.rtt_time if state.rtt_time else None
@@ -827,7 +890,7 @@ def run_ui(sender, state, clip):
             for i, btn in enumerate(toolbar_buttons):
                 bw = btn_w_list[i]
                 by = (TOOLBAR_H - BUTTON_H) // 2
-                btn.rect = pygame.Rect(bx, by, bw, BUTTON_H)
+                btn.rect = pygame.Rect(bx, by + int(toolbar_y_offset), bw, BUTTON_H)
 
                 # Hover highlight
                 if btn.hovered:
@@ -854,7 +917,7 @@ def run_ui(sender, state, clip):
             pygame.draw.line(tb_surf, (*COL_ACCENT, toolbar_alpha),
                              (0, TOOLBAR_H - 1), (ww, TOOLBAR_H - 1))
 
-            win.blit(tb_surf, (0, 0))
+            win.blit(tb_surf, (0, int(toolbar_y_offset)))
 
         pygame.display.flip()
         clock.tick(30)

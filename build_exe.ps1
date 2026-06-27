@@ -14,6 +14,13 @@ Write-Host "Устанавливаю зависимости + PyInstaller..." -F
 & $py -m pip install -r requirements.txt
 & $py -m pip install pyinstaller
 
+# Записываем дату сборки в version.py
+$buildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$verContent = Get-Content ".\version.py" -Encoding utf8
+$verContent = $verContent -replace '__build_date__\s*=\s*"[^"]*"', "__build_date__ = `"$buildDate`""
+$verContent | Set-Content ".\version.py" -Encoding utf8
+Write-Host "Build date: $buildDate" -ForegroundColor Gray
+
 Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
 & $py -m PyInstaller --onefile --windowed --noupx --name app `
     --hidden-import pynput.keyboard._win32 `

@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import urllib.request
 import urllib.error
-from version import __version__
+from version import __version__, __build_date__
 
 GITHUB_API_URL = "https://api.github.com/repos/nikitasever/remote-desktop/releases/latest"
 ASSET_NAME = "app.exe"
@@ -50,20 +50,28 @@ def check_for_update() -> tuple:
     latest = tag.lstrip("vV")
     changelog = data.get("body", "") or ""
 
-    if _parse_version(latest) <= _parse_version(__version__):
-        return (False, latest, "", changelog)
-
     # Find the exe asset
     download_url = ""
+    asset_updated = ""
     for asset in data.get("assets", []):
         if asset.get("name", "").lower() == ASSET_NAME:
             download_url = asset["browser_download_url"]
+            asset_updated = asset.get("updated_at", "")
             break
 
     if not download_url:
         return (False, latest, "", changelog)
 
-    return (True, latest, download_url, changelog)
+    # Newer version number → update
+    if _parse_version(latest) > _parse_version(__version__):
+        return (True, latest, download_url, changelog)
+
+    # Same version — compare build dates (covers re-uploaded releases)
+    if _parse_version(latest) == _parse_version(__version__) and asset_updated and __build_date__:
+        if asset_updated > __build_date__:
+            return (True, latest, download_url, changelog)
+
+    return (False, latest, "", changelog)
 
 
 def download_update(url: str, progress_callback=None) -> str:

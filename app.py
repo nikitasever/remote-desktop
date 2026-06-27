@@ -236,14 +236,15 @@ class LauncherUI:
             return
         self._gradient_id = self.root.after(50, self._start_gradient_animation)
 
-    def _animate_title_colors(self):
-        """Cycle title labels through random rainbow colors."""
-        self._title_hue_step += 1
-        h1 = (self._title_hue_step * 0.02) % 1.0
-        h2 = (h1 + 0.5) % 1.0
-        self._title_remote.configure(text_color=self._hue_to_hex(h1))
-        self._title_desktop.configure(text_color=self._hue_to_hex(h2))
-        self.root.after(60, self._animate_title_colors)
+    def _animate_title_wave(self):
+        """Wave of rainbow colors flowing right-to-left across each letter."""
+        self._title_wave_step += 1
+        n = len(self._title_letters)
+        for i, lbl in enumerate(self._title_letters):
+            offset = (n - 1 - i) * 0.08
+            h = (self._title_wave_step * 0.015 + offset) % 1.0
+            lbl.configure(text_color=self._hue_to_hex(h))
+        self.root.after(50, self._animate_title_wave)
 
     @staticmethod
     def _hue_to_hex(h):
@@ -313,16 +314,15 @@ class LauncherUI:
                                   corner_radius=2)
         accent_bar.pack(side="left", padx=(0, 8))
 
-        self._title_remote = ctk.CTkLabel(name_frame, text="Remote",
-                     font=ctk.CTkFont(size=20, weight="bold"),
-                     text_color=TEXT_PRIMARY)
-        self._title_remote.pack(side="left")
-        self._title_desktop = ctk.CTkLabel(name_frame, text="Desktop",
-                     font=ctk.CTkFont(size=20, weight="bold"),
-                     text_color=ACCENT)
-        self._title_desktop.pack(side="left")
-        self._title_hue_step = 0
-        self._animate_title_colors()
+        self._title_letters = []
+        title_font = ctk.CTkFont(size=20, weight="bold")
+        for ch in "RemoteDesktop":
+            lbl = ctk.CTkLabel(name_frame, text=ch, font=title_font,
+                               text_color=TEXT_PRIMARY)
+            lbl.pack(side="left", padx=0)
+            self._title_letters.append(lbl)
+        self._title_wave_step = 0
+        self._animate_title_wave()
 
         # -- Right: update + settings --
         right_frame = ctk.CTkFrame(inner, fg_color="transparent")

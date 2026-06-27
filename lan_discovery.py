@@ -61,7 +61,10 @@ class DiscoveryService:
                  port: int = DEFAULT_PORT, service_port: int = 5800,
                  version: str = "1.0.0"):
         self.host_id = str(host_id)
-        self.host_name = host_name or socket.gethostname()
+        try:
+            self.host_name = host_name or socket.gethostname()
+        except OSError:
+            self.host_name = "Unknown"
         self.port = port              # UDP discovery port
         self.service_port = service_port  # TCP port advertised in beacon
         self.version = version
@@ -72,21 +75,27 @@ class DiscoveryService:
         self._stop_event = threading.Event()
         self._broadcaster: threading.Thread | None = None
         self._listener: threading.Thread | None = None
+        self._failed = False  # True if start() failed
 
     # ------------------------------------------------------------------ public
 
     def start(self) -> None:
         """Запуск фоновых потоков broadcaster и listener."""
         self._stop_event.clear()
+        self._failed = False
 
-        self._broadcaster = threading.Thread(
-            target=self._broadcast_loop, daemon=True, name="discovery-tx")
-        self._listener = threading.Thread(
-            target=self._listen_loop, daemon=True, name="discovery-rx")
+        try:
+            self._broadcaster = threading.Thread(
+                target=self._broadcast_loop, daemon=True, name="discovery-tx")
+            self._listener = threading.Thread(
+                target=self._listen_loop, daemon=True, name="discovery-rx")
 
-        self._broadcaster.start()
-        self._listener.start()
-        logger.info("DiscoveryService started on UDP port %d", self.port)
+            self._broadcaster.start()
+            self._listener.start()
+            logger.info("DiscoveryService started on UDP port %d", self.port)
+        except (OSError, socket.error) as exc:
+            self._failed = True
+            logger.warning("DiscoveryService failed to start: %s", exc)
 
     def stop(self) -> None:
         """Остановка потоков (неблокирующая, потоки — daemon)."""
@@ -102,6 +111,8 @@ class DiscoveryService:
         Возвращает список обнаруженных устройств (thread-safe).
         Устройства, не отвечавшие более STALE_TIMEOUT секунд, удаляются.
         """
+        if self._failed:
+            return []
         now = time.time()
         with self._lock:
             # Удаляем устаревшие

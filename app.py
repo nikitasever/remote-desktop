@@ -5,6 +5,7 @@ RemoteDesktop — единое окно-лаунчер (AnyDesk-style UI).
 """
 
 import json
+import math
 import os
 import random
 import sys
@@ -50,8 +51,15 @@ TEXT_SECONDARY = "#94a3b8" # muted text
 TEXT_HINT = "#64748b"      # faint hints
 BORDER = "#334155"         # subtle border
 GREEN = "#22c55e"
+GREEN_DIM = "#166534"
 RED = "#ef4444"
 YELLOW = "#eab308"
+ACCENT_BRIGHT = "#60a5fa"
+
+# Gradient colors for ID section shimmer
+GRAD_A = "#1e3a5f"
+GRAD_B = "#0f172a"
+GRAD_C = "#1a2744"
 
 # -- Host ID persistence --
 _HOST_ID_FILE = os.path.join(APP_DIR, "host_id.json")
@@ -128,13 +136,21 @@ def _lerp_color(c1, c2, t):
 
 
 def _animate_button_hover(btn, target_color, current_color, base_color, step=0):
-    """Smooth color transition on hover/leave."""
+    """Smooth color transition on hover/leave with subtle scale effect."""
     t = min((step + 1) / 6.0, 1.0)
     c = _lerp_color(base_color, target_color, t)
+    # Subtle padding change to simulate scale
+    is_hover = (target_color != base_color)
+    pad = int(2 * t) if is_hover else int(2 * (1 - t))
     try:
         btn.configure(fg_color=c)
+        btn.configure(padx=max(0, btn._original_padx - pad) if hasattr(btn, '_original_padx') else None,
+                      pady=max(0, btn._original_pady - pad) if hasattr(btn, '_original_pady') else None)
     except Exception:
-        return
+        try:
+            btn.configure(fg_color=c)
+        except Exception:
+            return
     if t < 1.0:
         btn.after(16, _animate_button_hover, btn, target_color, c, base_color, step + 1)
 
@@ -143,6 +159,11 @@ class LauncherUI:
     def __init__(self, root):
         self.root = root
         self._status_pulse_id = None
+        self._id_pulse_id = None
+        self._gradient_id = None
+        self._connect_pulse_id = None
+        self._gradient_step = 0
+        self._id_pulse_step = 0
         root.title("RemoteDesktop")
         root.resizable(True, True)
         root.minsize(520, 600)
@@ -178,6 +199,82 @@ class LauncherUI:
         self._build_footer()
 
         self._switch_tab("recent")
+
+        # Start decorative animations
+        self._start_gradient_animation()
+        self._start_id_pulse()
+        self._start_connect_pulse()
+
+    # ================================================================
+    #  DECORATIVE ANIMATIONS
+    # ================================================================
+
+    def _start_gradient_animation(self):
+        """Animate subtle gradient shimmer on the ID section canvas."""
+        if not hasattr(self, '_id_canvas'):
+            return
+        self._gradient_step += 1
+        t = self._gradient_step * 0.015
+        t1 = (math.sin(t) + 1) / 2
+        t2 = (math.sin(t + 2.094) + 1) / 2
+        c1 = _lerp_color(GRAD_A, GRAD_B, t1)
+        c2 = _lerp_color(GRAD_B, GRAD_C, t2)
+        try:
+            w = self._id_canvas.winfo_width() or 500
+            h = self._id_canvas.winfo_height() or 120
+            self._id_canvas.delete("gradient")
+            bands = 8
+            for i in range(bands):
+                frac = i / max(bands - 1, 1)
+                color = _lerp_color(c1, c2, frac)
+                y0 = int(h * i / bands)
+                y1 = int(h * (i + 1) / bands)
+                self._id_canvas.create_rectangle(0, y0, w, y1, fill=color,
+                                                 outline="", tags="gradient")
+            self._id_canvas.tag_lower("gradient")
+        except Exception:
+            return
+        self._gradient_id = self.root.after(50, self._start_gradient_animation)
+
+    def _start_id_pulse(self):
+        """Pulse the host ID label color between ACCENT and ACCENT_BRIGHT."""
+        self._id_pulse_step += 1
+        t = (math.sin(self._id_pulse_step * 0.035) + 1) / 2
+        c = _lerp_color(ACCENT, ACCENT_BRIGHT, t)
+        try:
+            self.host_id_label.configure(text_color=c)
+        except Exception:
+            return
+        self._id_pulse_id = self.root.after(50, self._start_id_pulse)
+
+    def _start_connect_pulse(self):
+        """Gentle pulse on the connect button when idle."""
+        if not hasattr(self, '_connect_btn'):
+            return
+        self._connect_pulse_step = getattr(self, '_connect_pulse_step', 0) + 1
+        t = (math.sin(self._connect_pulse_step * 0.04) + 1) / 2
+        c = _lerp_color(ACCENT, ACCENT_BRIGHT, t * 0.4)
+        try:
+            self._connect_btn.configure(fg_color=c)
+        except Exception:
+            return
+        self._connect_pulse_id = self.root.after(50, self._start_connect_pulse)
+
+    def _animate_card_hover(self, card, entering):
+        """Smooth border color transition on card hover."""
+        target = ACCENT if entering else BORDER
+        start = BORDER if entering else ACCENT
+        self._card_hover_anim(card, start, target, 0)
+
+    def _card_hover_anim(self, card, start, target, step):
+        t = min((step + 1) / 5.0, 1.0)
+        c = _lerp_color(start, target, t)
+        try:
+            card.configure(border_color=c)
+        except Exception:
+            return
+        if t < 1.0:
+            card.after(30, self._card_hover_anim, card, start, target, step + 1)
 
     # ================================================================
     #  UI CONSTRUCTION
@@ -250,26 +347,40 @@ class LauncherUI:
         )
         self.remote_id_entry.pack(side="left", fill="x", expand=True)
 
-        connect_btn = ctk.CTkButton(
+        self._connect_btn = ctk.CTkButton(
             addr_inner, text="➜", width=36, height=32,
             corner_radius=6, font=ctk.CTkFont(size=16, weight="bold"),
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
             text_color="#ffffff",
             command=self._on_connect,
         )
-        connect_btn.pack(side="right", padx=(4, 0))
+        self._connect_btn.pack(side="right", padx=(4, 0))
 
     def _build_id_section(self):
-        """Big ID display: 'Это рабочее место' + formatted ID + copy."""
-        id_section = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        id_section.pack(fill="x", padx=24, pady=(24, 0))
+        """Big ID display with animated gradient canvas background."""
+        id_outer = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        id_outer.pack(fill="x", padx=24, pady=(24, 0))
+
+        # Canvas for animated gradient background
+        self._id_canvas = tk.Canvas(id_outer, height=110, bg=GRAD_B,
+                                    highlightthickness=0, bd=0)
+        self._id_canvas.pack(fill="x")
+
+        # Overlay frame on canvas
+        id_section = ctk.CTkFrame(self._id_canvas, fg_color="transparent")
+        self._id_canvas.create_window(0, 0, window=id_section, anchor="nw",
+                                      tags="content")
+
+        def _resize_canvas(event):
+            self._id_canvas.itemconfigure("content", width=event.width)
+        self._id_canvas.bind("<Configure>", _resize_canvas)
 
         ctk.CTkLabel(id_section, text="Это рабочее место",
                      font=ctk.CTkFont(size=14),
-                     text_color=TEXT_SECONDARY).pack(anchor="center")
+                     text_color=TEXT_SECONDARY).pack(anchor="center", pady=(16, 0))
 
         id_row = ctk.CTkFrame(id_section, fg_color="transparent")
-        id_row.pack(anchor="center", pady=(6, 0))
+        id_row.pack(anchor="center", pady=(6, 16))
 
         self.host_id_label = ctk.CTkLabel(
             id_row,
@@ -417,10 +528,10 @@ class LauncherUI:
 
     def _switch_tab(self, key):
         self._active_tab.set(key)
-        # Update button styles
+        # Animate tab button color transitions
         for k, btn in self._tab_buttons.items():
             if k == key:
-                btn.configure(text_color=ACCENT, fg_color=BG_CARD)
+                self._animate_tab_btn(btn, TEXT_HINT, ACCENT, BG_CARD, 0)
             else:
                 btn.configure(text_color=TEXT_HINT, fg_color="transparent")
         # Clear content
@@ -433,6 +544,35 @@ class LauncherUI:
             self._populate_favorites()
         elif key == "discovered":
             self._populate_discovered()
+        # Fade-in new content
+        self._fade_tab_content(0)
+
+    def _animate_tab_btn(self, btn, from_color, to_color, bg_color, step):
+        t = min((step + 1) / 5.0, 1.0)
+        c = _lerp_color(from_color, to_color, t)
+        try:
+            btn.configure(text_color=c, fg_color=bg_color)
+        except Exception:
+            return
+        if t < 1.0:
+            btn.after(30, self._animate_tab_btn, btn, from_color, to_color, bg_color, step + 1)
+
+    def _fade_tab_content(self, step):
+        """Fade in tab content by transitioning child text colors from dim to normal."""
+        t = min((step + 1) / 6.0, 1.0)
+        # Apply progressive opacity simulation to all children
+        try:
+            for w in self.tab_content.winfo_children():
+                # Fade card backgrounds from BG_DARK to BG_CARD
+                c = _lerp_color(BG_DARK, BG_CARD, t)
+                try:
+                    w.configure(fg_color=c)
+                except Exception:
+                    pass
+        except Exception:
+            return
+        if t < 1.0:
+            self.root.after(30, self._fade_tab_content, step + 1)
 
     def _populate_recent(self):
         if session_history is None:
@@ -520,6 +660,10 @@ class LauncherUI:
         ctk.CTkLabel(inner, text=star, font=ctk.CTkFont(size=16),
                      text_color=star_color, width=20).pack(side="right")
 
+        # Hover effect
+        card.bind("<Enter>", lambda e, c=card: self._animate_card_hover(c, True))
+        card.bind("<Leave>", lambda e, c=card: self._animate_card_hover(c, False))
+
         # Click to connect
         card.bind("<Button-1>", lambda e, s=session: self._connect_to_session(s))
         for child in inner.winfo_children():
@@ -560,6 +704,10 @@ class LauncherUI:
         ctk.CTkLabel(info, text="  ·  ".join(sub_parts),
                      font=ctk.CTkFont(size=11),
                      text_color=TEXT_SECONDARY).pack(anchor="w")
+
+        # Hover effect
+        card.bind("<Enter>", lambda e, c=card: self._animate_card_hover(c, True))
+        card.bind("<Leave>", lambda e, c=card: self._animate_card_hover(c, False))
 
         card.bind("<Button-1>", lambda e, d=device: self._connect_to_device(d))
 
@@ -718,6 +866,12 @@ class LauncherUI:
         a.codec = {"Авто": "auto", "JPEG": "jpeg", "PNG": "png"}.get(self.codec.get(), "auto")
         a.engine = {"Видео H.264": "auto",
                     "Плитки (совместимость)": "tiles"}.get(self.engine.get(), "auto")
+        # Подтягиваем выбранный энкодер из настроек (settings_display.py).
+        try:
+            from settings_config import config as _scfg
+            a.hw_encoder = _scfg.get("hw_encoder", "auto")
+        except Exception:
+            a.hw_encoder = "auto"
         a.relay = addr
         a.unique_id = self.host_id
         return a
@@ -889,9 +1043,10 @@ class LauncherUI:
             self.status_text.configure(text=text)
         if state == "waiting":
             self._pulse_status(YELLOW, 0)
+        elif state == "connected":
+            self._pulse_status_connected(0)
 
     def _pulse_status(self, color, step):
-        import math
         alpha = 0.4 + 0.6 * abs(math.sin(step * 0.08))
         c = _lerp_color(BG_DARK, color, alpha)
         try:
@@ -899,6 +1054,16 @@ class LauncherUI:
         except Exception:
             return
         self._status_pulse_id = self.root.after(40, self._pulse_status, color, step + 1)
+
+    def _pulse_status_connected(self, step):
+        """Smooth green pulse between dim and bright when connected."""
+        t = (math.sin(step * 0.05) + 1) / 2
+        c = _lerp_color(GREEN_DIM, GREEN, t)
+        try:
+            self.status_dot.configure(text_color=c)
+        except Exception:
+            return
+        self._status_pulse_id = self.root.after(50, self._pulse_status_connected, step + 1)
 
 
 def _setup_logging():
@@ -924,6 +1089,11 @@ def _setup_logging():
 
 def main():
     _setup_logging()
+    if updater is not None:
+        try:
+            updater.cleanup_old_update()
+        except Exception:
+            pass
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     root = ctk.CTk()

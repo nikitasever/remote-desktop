@@ -72,24 +72,27 @@ def download_update(url: str, progress_callback=None) -> str:
     progress_callback(bytes_downloaded, total_bytes) is called periodically.
     Returns path to the downloaded file.
     """
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        total = int(resp.headers.get("Content-Length", 0))
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe", prefix="rd_update_")
-        tmp_path = tmp.name
-        downloaded = 0
-        chunk_size = 64 * 1024
-        try:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                tmp.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback:
-                    progress_callback(downloaded, total)
-        finally:
-            tmp.close()
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe", prefix="rd_update_")
+            tmp_path = tmp.name
+            downloaded = 0
+            chunk_size = 64 * 1024
+            try:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback:
+                        progress_callback(downloaded, total)
+            finally:
+                tmp.close()
+    except (urllib.error.URLError, OSError, ConnectionError) as exc:
+        raise RuntimeError(f"Не удалось скачать обновление: {exc}") from exc
     return tmp_path
 
 

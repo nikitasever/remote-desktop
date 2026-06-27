@@ -359,7 +359,7 @@ def screen_info(streamer):
 
 
 def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=SCALE,
-          codec=CODEC, engine="auto"):
+          codec=CODEC, engine="auto", hw_encoder="auto"):
     chan = common.SecureChannel(key)
 
     # Рукопожатие: клиент должен прислать корректно зашифрованный HELLO.
@@ -550,7 +550,12 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
     encoder = None
 
     def _new_encoder():
-        prefer = "libx264" if engine == "x264" else "auto"
+        if engine == "x264":
+            prefer = "libx264"
+        elif hw_encoder not in (None, "", "auto"):
+            prefer = hw_encoder
+        else:
+            prefer = "auto"
         enc = video_mod.VideoEncoder(
             streamer.w, streamer.h, fps=fps,
             bitrate=video_mod.quality_to_bitrate(quality, streamer.w, streamer.h),
@@ -753,6 +758,7 @@ def run_host(args, stop_event=None):
         scale=getattr(args, "scale", SCALE),
         codec=getattr(args, "codec", CODEC),
         engine=getattr(args, "engine", "auto"),
+        hw_encoder=getattr(args, "hw_encoder", "auto"),
     )
     LOG(f"[host] принятые файлы будут сохраняться в: {args.downloads}")
     if args.relay:

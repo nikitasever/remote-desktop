@@ -49,6 +49,7 @@ DEFAULTS = {
     "display.codec": "auto",
     "display.engine": "auto",
     "display.show_cursor": True,
+    "hw_encoder": "auto",
 
     # Аудио
     "audio.enabled": False,

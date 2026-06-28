@@ -148,7 +148,7 @@ del "%~f0"
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
         close_fds=True,
     )
-    sys.exit(0)
+    os._exit(0)
 
 
 def check_and_update(progress_callback=None):

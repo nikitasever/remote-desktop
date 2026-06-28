@@ -10,6 +10,7 @@ import os
 import random
 import secrets
 import string
+import subprocess
 import sys
 import traceback
 import threading
@@ -962,6 +963,62 @@ class LauncherUI:
             self.remote_id.set(addr)
             self._do_direct_connect(addr)
 
+    def _launch_client_process(self, args):
+        """Run the client viewer in a SEPARATE process so pygame never shares a
+        thread with this tkinter launcher. The launcher stays alive and
+        responsive; when the session ends, we just update the status — no crash,
+        no closing the whole app. Password is passed via stdin (never on disk)."""
+        payload = json.dumps({
+            "password": args.password,
+            "relay": getattr(args, "relay", None),
+            "connect": getattr(args, "connect", None),
+            "unique_id": getattr(args, "unique_id", None),
+            "id": getattr(args, "id", "default"),
+            "downloads": getattr(args, "downloads", DEFAULT_DOWNLOADS),
+        }).encode("utf-8")
+
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--rd-client"]
+        else:
+            cmd = [sys.executable, os.path.abspath(sys.argv[0]), "--rd-client"]
+
+        err_path = os.path.join(APP_DIR, "client_error.txt")
+        try:
+            os.remove(err_path)
+        except OSError:
+            pass
+
+        try:
+            devnull = open(os.devnull, "wb")
+            p = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=devnull, stderr=devnull,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            p.stdin.write(payload)
+            p.stdin.close()
+        except Exception as e:
+            messagebox.showerror("Ошибка подключения", str(e), parent=self.root)
+            self._set_status("error", str(e)[:60])
+            return
+
+        self._set_status("connected", "Сессия активна")
+        self._poll_client_process(p, err_path)
+
+    def _poll_client_process(self, p, err_path):
+        """Poll the client subprocess; update launcher status when it ends."""
+        if p.poll() is None:
+            self.root.after(600, self._poll_client_process, p, err_path)
+            return
+        if p.returncode not in (0, None) and os.path.exists(err_path):
+            try:
+                msg = open(err_path, encoding="utf-8").read().strip()
+            except Exception:
+                msg = "Соединение завершено с ошибкой."
+            self._set_status("error", msg[:60])
+            messagebox.showerror("Подключение", msg, parent=self.root)
+        else:
+            self._set_status("idle", "Сессия завершена")
+
     def _do_client_connect(self, remote_id):
         """Connect to a remote host via relay using its 9-digit ID."""
         remote = remote_id.replace(" ", "").strip()
@@ -982,15 +1039,7 @@ class LauncherUI:
         self._persist()
         args = Args(password=pw, relay=addr, unique_id=remote)
         self._set_status("waiting", "Подключение…")
-        self.root.withdraw()
-        try:
-            client.run_client(args)
-        except Exception as e:
-            self.root.deiconify()
-            messagebox.showerror("Ошибка подключения", str(e), parent=self.root)
-            self._set_status("error", str(e)[:60])
-            return
-        self.root.destroy()
+        self._launch_client_process(args)
 
     def _do_direct_connect(self, addr):
         """Connect directly to IP:port."""
@@ -1002,15 +1051,7 @@ class LauncherUI:
         self._persist()
         args = Args(password=pw, connect=addr)
         self._set_status("waiting", "Подключение…")
-        self.root.withdraw()
-        try:
-            client.run_client(args)
-        except Exception as e:
-            self.root.deiconify()
-            messagebox.showerror("Ошибка подключения", str(e), parent=self.root)
-            self._set_status("error", str(e)[:60])
-            return
-        self.root.destroy()
+        self._launch_client_process(args)
 
     # ================================================================
     #  ARGS BUILDING
@@ -1112,14 +1153,7 @@ class LauncherUI:
         if role == "host":
             self._run_host_window(args)
         else:
-            self.root.withdraw()
-            try:
-                client.run_client(args)
-            except Exception as e:
-                self.root.deiconify()
-                messagebox.showerror("Ошибка подключения", str(e), parent=self.root)
-                return
-            self.root.destroy()
+            self._launch_client_process(args)
 
     def _run_host_window(self, args):
         """Hide launcher, show host log window (dark-themed)."""
@@ -1254,7 +1288,76 @@ def _setup_logging():
     sys.excepthook = hook
 
 
+def _run_client_subprocess():
+    """Client-viewer mode: read args JSON from stdin, run the pygame viewer in
+    THIS dedicated process so it never shares a thread with the launcher's
+    tkinter loop (mixing pygame+tk crashed the app when a session ended).
+    Any startup error is written to client_error.txt for the parent to show."""
+    try:
+        raw = sys.stdin.buffer.read().decode("utf-8")
+        cfg = json.loads(raw)
+    except Exception:
+        sys.exit(2)
+    try:
+        client.run_client(Args(**cfg))
+    except Exception as e:
+        try:
+            os.makedirs(APP_DIR, exist_ok=True)
+            with open(os.path.join(APP_DIR, "client_error.txt"), "w", encoding="utf-8") as f:
+                f.write(str(e))
+        except Exception:
+            pass
+        sys.exit(2)
+    sys.exit(0)
+
+
+def _run_host_headless():
+    """Unattended host mode (no GUI) for autostart/service. Reads the saved
+    config and runs host.run_host until the process is stopped. Screen capture
+    only works in the user's interactive session, so this is launched at LOGON
+    (see install_service.ps1), NOT as a SYSTEM/session-0 service."""
+    _setup_logging()
+    cfg = load_config()
+    pw = cfg.get("password", "")
+    if not pw:
+        print("[host-headless] нет пароля в конфиге — нечего запускать")
+        return
+    host_id = _get_or_create_host_id()
+    a = Args(password=pw, id=cfg.get("id", "default"))
+    a.downloads = cfg.get("downloads", DEFAULT_DOWNLOADS)
+    try:
+        a.quality = int(cfg.get("quality", 70))
+        a.fps = int(cfg.get("fps", 20))
+    except (TypeError, ValueError):
+        a.quality, a.fps = 70, 20
+    a.scale = {"100%": 1.0, "75%": 0.75, "50%": 0.5}.get(cfg.get("scale", "100%"), 1.0)
+    a.engine = {"Видео H.264": "auto",
+                "Плитки (совместимость)": "tiles"}.get(cfg.get("engine", "Видео H.264"), "auto")
+    if cfg.get("conn", "relay") == "direct":
+        try:
+            a.listen = int(cfg.get("listen_port", 5900))
+        except (TypeError, ValueError):
+            a.listen = 5900
+    else:
+        a.relay = cfg.get("address", "").strip()
+        a.unique_id = host_id
+        if not a.relay:
+            print("[host-headless] нет адреса relay в конфиге")
+            return
+    print(f"[host-headless] запуск хоста, ID {host_id}")
+    try:
+        host.run_host(a)
+    except Exception as e:
+        print(f"[host-headless] хост остановлен: {e}")
+
+
 def main():
+    if "--rd-client" in sys.argv:
+        _run_client_subprocess()
+        return
+    if "--rd-host" in sys.argv:
+        _run_host_headless()
+        return
     _setup_logging()
     if updater is not None:
         try:

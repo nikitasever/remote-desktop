@@ -1,164 +1,93 @@
 <#
 .SYNOPSIS
-    Registers a Scheduled Task that runs the remote-desktop host at system startup
-    (before any user logs in), under the SYSTEM account.
+    Registers RemoteDesktop host to start automatically at user logon, so the
+    machine is always reachable (like AnyDesk's unattended access).
 
 .DESCRIPTION
-    Uses Register-ScheduledTask (Windows 10+) to create a task that:
-      - Triggers at system startup (boot)
-      - Runs whether or not a user is logged on
-      - Runs as NT AUTHORITY\SYSTEM
-      - Auto-restarts on failure (via service.py --restart-delay)
+    Creates a Scheduled Task that runs `app.exe --rd-host` AT LOGON of the
+    current user, with highest privileges and auto-restart on failure.
 
-    The task invokes service.py with the parameters you supply here.
-    Requires an elevated (Administrator) PowerShell session.
+    IMPORTANT — why logon (user session) and NOT a SYSTEM service:
+    A Windows service / SYSTEM task runs in session 0 and can only capture
+    session-0's desktop, NOT the logged-in user's screen. For screen sharing
+    to actually work, the host MUST run inside the user's interactive session.
+    Therefore this registers a per-user logon task, which is the correct
+    "service for correct operation" for a remote-desktop host.
 
-.PARAMETER Mode
-    Connection mode: "relay" or "listen".
+    Configure connection/password FIRST by running app.exe once and saving
+    settings (relay address + password); --rd-host reads that saved config.
 
-.PARAMETER Relay
-    Relay address (host:port). Required if Mode is "relay".
-
-.PARAMETER Id
-    Relay room ID. Default: "default".
-
-.PARAMETER ListenPort
-    Direct-listen port. Required if Mode is "listen".
-
-.PARAMETER Password
-    Shared E2E password (required).
-
-.PARAMETER PythonPath
-    Path to python.exe. Default: python.exe in the venv next to this script's repo.
+.PARAMETER ExePath
+    Path to app.exe. Default: dist\app.exe next to this script, else this dir.
 
 .PARAMETER TaskName
-    Name of the Scheduled Task. Default: "RemoteDesktopHost".
+    Scheduled Task name. Default: "RemoteDesktopHost".
 
 .EXAMPLE
-    # Relay mode
-    .\install_service.ps1 -Mode relay -Relay "vps.example.com:5800" -Id myroom -Password "SECRET"
-
-    # Direct mode
-    .\install_service.ps1 -Mode listen -ListenPort 5900 -Password "SECRET"
+    .\install_service.ps1
+    .\install_service.ps1 -ExePath "C:\Path\to\app.exe"
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
-    [ValidateSet("relay", "listen")]
-    [string]$Mode,
-
-    [string]$Relay,
-    [string]$Id = "default",
-    [int]$ListenPort = 5900,
-
-    [Parameter(Mandatory)]
-    [string]$Password,
-
-    [string]$PythonPath,
+    [string]$ExePath,
     [string]$TaskName = "RemoteDesktopHost"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# --- Resolve paths ---
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$servicePy = Join-Path $scriptDir "service.py"
 
-if (-not (Test-Path $servicePy)) {
-    Write-Error "service.py not found at $servicePy"
+if (-not $ExePath) {
+    $candidates = @(
+        (Join-Path $scriptDir "dist\app.exe"),
+        (Join-Path $scriptDir "app.exe")
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { $ExePath = $c; break } }
+}
+if (-not $ExePath -or -not (Test-Path $ExePath)) {
+    Write-Error "app.exe не найден. Укажите путь: -ExePath C:\...\app.exe"
     exit 1
 }
+$ExePath = (Resolve-Path $ExePath).Path
+Write-Host "Exe: $ExePath"
 
-if (-not $PythonPath) {
-    # Try venv in the parent repo directory first
-    $venvPy = Join-Path (Split-Path -Parent $scriptDir) ".venv\Scripts\python.exe"
-    if (Test-Path $venvPy) {
-        $PythonPath = $venvPy
-    } else {
-        $venvPy = Join-Path $scriptDir ".venv\Scripts\python.exe"
-        if (Test-Path $venvPy) {
-            $PythonPath = $venvPy
-        } else {
-            $PythonPath = "python.exe"
-        }
-    }
-}
+# Текущий пользователь — задача запускается в ЕГО сессии (нужно для захвата экрана)
+$user = "$env:USERDOMAIN\$env:USERNAME"
+Write-Host "Пользователь: $user"
 
-Write-Host "Python: $PythonPath"
-Write-Host "Service script: $servicePy"
-
-# --- Build arguments for service.py ---
-$svcArgs = @("`"$servicePy`"")
-
-if ($Mode -eq "relay") {
-    if (-not $Relay) {
-        Write-Error "-Relay is required when Mode is 'relay'"
-        exit 1
-    }
-    $svcArgs += "--relay", $Relay, "--id", $Id
-} else {
-    $svcArgs += "--listen", $ListenPort
-}
-
-$svcArgs += "--password", $Password
-
-$argString = $svcArgs -join " "
-
-# --- Check for admin ---
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
-           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (-not $isAdmin) {
-    Write-Warning @"
-This script must be run as Administrator to register a SYSTEM-level Scheduled Task.
-Re-run this PowerShell session as Administrator.
-"@
-    exit 1
-}
-
-# --- Remove existing task if present (idempotent) ---
+# Удаляем старую задачу, если есть (идемпотентность)
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "Removing existing task '$TaskName'..."
+    Write-Host "Удаляю существующую задачу '$TaskName'..."
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-# --- Create Scheduled Task ---
-$action = New-ScheduledTaskAction `
-    -Execute $PythonPath `
-    -Argument $argString `
-    -WorkingDirectory $scriptDir
+$action = New-ScheduledTaskAction -Execute $ExePath -Argument "--rd-host" `
+    -WorkingDirectory (Split-Path -Parent $ExePath)
 
-$trigger = New-ScheduledTaskTrigger -AtStartup
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 
-$principal = New-ScheduledTaskPrincipal `
-    -UserId "NT AUTHORITY\SYSTEM" `
-    -LogonType ServiceAccount `
-    -RunLevel Highest
+$principal = New-ScheduledTaskPrincipal -UserId $user `
+    -LogonType Interactive -RunLevel Highest
 
 $settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
-    -ExecutionTimeLimit (New-TimeSpan -Days 0)
+    -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger $trigger `
-    -Principal $principal `
-    -Settings $settings `
-    -Description "Remote Desktop Host (unattended mode) - runs service.py at boot as SYSTEM" `
-    -Force
+Register-ScheduledTask -TaskName $TaskName `
+    -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+    -Description "RemoteDesktop host (автозапуск при входе пользователя)" -Force | Out-Null
 
 Write-Host ""
-Write-Host "Scheduled Task '$TaskName' registered successfully." -ForegroundColor Green
-Write-Host "It will start automatically at next boot."
-Write-Host "To start it now:  Start-ScheduledTask -TaskName '$TaskName'"
-Write-Host "To check status:  Get-ScheduledTask -TaskName '$TaskName' | Get-ScheduledTaskInfo"
+Write-Host "Задача '$TaskName' зарегистрирована." -ForegroundColor Green
+Write-Host "Хост будет стартовать автоматически при входе в Windows."
+Write-Host "Запустить сейчас:  Start-ScheduledTask -TaskName '$TaskName'"
+Write-Host "Статус:            Get-ScheduledTask -TaskName '$TaskName' | Get-ScheduledTaskInfo"
+Write-Host "Удалить:           .\uninstall_service.ps1"
 Write-Host ""
-Write-Host "To uninstall:     .\uninstall_service.ps1 -TaskName '$TaskName'"
+Write-Host "ВАЖНО: сначала запустите app.exe один раз, укажите relay/пароль и" -ForegroundColor Yellow
+Write-Host "включите хост — эти настройки сохранятся и будут использованы --rd-host." -ForegroundColor Yellow

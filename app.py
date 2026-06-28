@@ -8,6 +8,8 @@ import json
 import math
 import os
 import random
+import secrets
+import string
 import sys
 import traceback
 import threading
@@ -118,6 +120,36 @@ def save_config(data):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# -- Password strength helpers --
+COMMON_PASSWORDS = {"12345", "password", "qwerty", "123456", "111111", "000000"}
+PW_ALPHABET = string.ascii_letters + string.digits + "!@#$%^&*-_=+?"
+
+
+def _is_weak_password(pw):
+    """True if password is too short or a well-known weak one."""
+    return len(pw) < 8 or pw.lower() in COMMON_PASSWORDS
+
+
+def _password_strength(pw):
+    """Return (label, color) describing the password strength."""
+    if not pw or _is_weak_password(pw):
+        return ("Слабый", RED)
+    variety = sum(bool(s) for s in (
+        any(c.islower() for c in pw),
+        any(c.isupper() for c in pw),
+        any(c.isdigit() for c in pw),
+        any(not c.isalnum() for c in pw),
+    ))
+    if len(pw) >= 12 and variety >= 3:
+        return ("Надёжный", GREEN)
+    return ("Средний", YELLOW)
+
+
+def _generate_password(length=16):
+    """Generate a strong random password using the secrets module."""
+    return "".join(secrets.choice(PW_ALPHABET) for _ in range(length))
 
 
 def _hex_to_rgb(h):
@@ -471,6 +503,34 @@ class LauncherUI:
         )
         self.pw_toggle_btn.pack(side="left", padx=(4, 0))
 
+        self.pw_gen_btn = ctk.CTkButton(
+            pw_row, text="Сгенерировать", width=110, height=30,
+            corner_radius=6, font=ctk.CTkFont(size=11),
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color="#ffffff", command=self._generate_pw,
+        )
+        self.pw_gen_btn.pack(side="left", padx=(6, 0))
+
+        # Live strength indicator below the password field
+        strength_row = ctk.CTkFrame(inner, fg_color="transparent")
+        strength_row.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(strength_row, text="Надёжность:",
+                     font=ctk.CTkFont(size=11),
+                     text_color=TEXT_HINT).pack(side="left")
+
+        self.pw_strength_label = ctk.CTkLabel(
+            strength_row, text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=TEXT_HINT,
+        )
+        self.pw_strength_label.pack(side="left", padx=(6, 0))
+
+        # Update live as the user types
+        self.pw_entry.bind("<KeyRelease>", lambda e: self._update_pw_strength())
+        self.password.trace_add("write", lambda *a: self._update_pw_strength())
+        self._update_pw_strength()
+
         # Relay address (small)
         addr_row = ctk.CTkFrame(inner, fg_color="transparent")
         addr_row.pack(fill="x", padx=16, pady=(0, 10))
@@ -747,6 +807,35 @@ class LauncherUI:
         self._show_pw.set(not self._show_pw.get())
         self.pw_entry.configure(show="" if self._show_pw.get() else "*")
 
+    def _update_pw_strength(self):
+        """Refresh the live password strength indicator."""
+        if not hasattr(self, "pw_strength_label"):
+            return
+        pw = self.password.get()
+        if not pw:
+            try:
+                self.pw_strength_label.configure(text="—", text_color=TEXT_HINT)
+            except Exception:
+                pass
+            return
+        label, color = _password_strength(pw)
+        try:
+            self.pw_strength_label.configure(text=label, text_color=color)
+        except Exception:
+            pass
+
+    def _generate_pw(self):
+        """Fill the password field with a strong random password and reveal it."""
+        new_pw = _generate_password(16)
+        self.password.set(new_pw)
+        # Reveal so the user can copy it
+        self._show_pw.set(True)
+        try:
+            self.pw_entry.configure(show="")
+        except Exception:
+            pass
+        self._update_pw_strength()
+
     def _on_update(self):
         if updater is None:
             return
@@ -812,6 +901,19 @@ class LauncherUI:
             self.host_switch.deselect()
             self._hosting.set(False)
             return
+        # Warn on weak passwords — they get brute-forced in seconds.
+        if _is_weak_password(self.password.get()):
+            proceed = messagebox.askyesno(
+                "Слабый пароль",
+                "Пароль слишком слабый и может быть подобран за секунды. "
+                "Продолжить?",
+                parent=self.root,
+            )
+            if not proceed:
+                self.host_switch.deselect()
+                self._hosting.set(False)
+                self._set_status("idle", "Готов к подключению")
+                return
         self._persist()
         self._set_status("waiting", "Хост запущен, ожидание…")
         self._host_stop_event = threading.Event()

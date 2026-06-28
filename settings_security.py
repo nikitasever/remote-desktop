@@ -81,6 +81,16 @@ def create_page(parent, config):
 
     pwd_var.trace_add("write", _on_pwd_change)
 
+    # Security advisory: weak passwords are the only barrier to full control.
+    ctk.CTkLabel(
+        page,
+        text=("Используйте пароль не короче "
+              + str(config.get("security.min_password_length", 12))
+              + " символов: подключившийся получает полный контроль над ПК."),
+        font=("Segoe UI", 12), text_color="#eab308",
+        anchor="w", wraplength=420, justify="left",
+    ).pack(fill="x", padx=32, pady=(2, 4))
+
     # ── Двухфакторная аутентификация ─────────────────────────────────────
     _section("Двухфакторная аутентификация")
     _checkbox("Требовать подтверждение при подключении",

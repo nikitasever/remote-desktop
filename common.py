@@ -60,19 +60,45 @@ def derive_key(password: str) -> bytes:
     return kdf.derive(password.encode("utf-8"))
 
 
+class ReplayError(Exception):
+    """Кадр с непрогрессирующим порядковым номером — повтор или переупорядочивание."""
+
+
 class SecureChannel:
-    """Шифрование/дешифрование тела сообщений поверх сокета."""
+    """Шифрование/дешифрование тела сообщений поверх сокета.
+
+    Анти-replay: внутрь каждого шифруемого тела добавляется монотонный
+    8-байтный порядковый номер. Получатель отвергает кадр, чей номер не
+    строго больше последнего принятого (TCP упорядочен и надёжен, поэтому
+    легитимные кадры всегда возрастают; записанный/переигранный кадр имеет
+    старый номер и будет отброшен с ReplayError). Счётчики per-instance и
+    однонаправленные: _send_seq — для исходящих, _recv_seq — для входящих.
+    """
 
     def __init__(self, key: bytes):
         self._aes = AESGCM(key)
+        self._send_seq = 0
+        self._recv_seq = -1
+        self._send_lock = threading.Lock()
+        self._recv_lock = threading.Lock()
 
     def encrypt(self, plaintext: bytes) -> bytes:
+        with self._send_lock:
+            seq = self._send_seq
+            self._send_seq += 1
         nonce = os.urandom(12)
-        return nonce + self._aes.encrypt(nonce, plaintext, None)
+        body = struct.pack(">Q", seq) + plaintext
+        return nonce + self._aes.encrypt(nonce, body, None)
 
     def decrypt(self, blob: bytes) -> bytes:
         nonce, ct = blob[:12], blob[12:]
-        return self._aes.decrypt(nonce, ct, None)  # бросит исключение при неверном пароле
+        body = self._aes.decrypt(nonce, ct, None)  # бросит исключение при неверном пароле
+        (seq,) = struct.unpack(">Q", body[:8])
+        with self._recv_lock:
+            if seq <= self._recv_seq:
+                raise ReplayError(f"повтор кадра seq={seq} (последний {self._recv_seq})")
+            self._recv_seq = seq
+        return body[8:]
 
 
 # ---- Кадрирование на сокете ----

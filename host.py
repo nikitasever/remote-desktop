@@ -86,6 +86,50 @@ CODEC = "auto"        # формат плиток: "auto" | "jpeg" | "png"
 # Логгер можно переопределить из GUI (host.LOG = my_func)
 LOG = print
 
+# ---- Безопасность: ограничение доступа к ФС и защита от брутфорса ----
+
+# Разрешено ли клиенту просматривать ФС хоста и тянуть файлы.
+# Управляется env RD_ALLOW_FILE_BROWSING ("0" — полностью запретить).
+ALLOW_FILE_BROWSING = os.environ.get("RD_ALLOW_FILE_BROWSING", "1") != "0"
+
+# Базовые каталоги, внутри которых разрешён просмотр/чтение файлов.
+# Дополняется downloads_dir в serve() (через _allowed_bases()).
+ALLOWED_BASE_DIRS = [os.path.expanduser("~")]
+
+# Брутфорс-защита (direct-режим): счётчик неудачных попыток на IP.
+BRUTEFORCE_THRESHOLD = 5          # после стольких фейлов начинается backoff
+BRUTEFORCE_MAX_BACKOFF = 300      # максимум секунд задержки на IP
+_failed_attempts = {}            # ip -> {"fails": int, "until": float}
+_failed_lock = threading.Lock()
+
+
+def _record_auth_failure(ip):
+    """Зарегистрировать неудачную аутентификацию с IP и продлить backoff-окно."""
+    now = time.time()
+    with _failed_lock:
+        rec = _failed_attempts.get(ip, {"fails": 0, "until": 0.0})
+        rec["fails"] += 1
+        if rec["fails"] > BRUTEFORCE_THRESHOLD:
+            delay = min(2 ** (rec["fails"] - BRUTEFORCE_THRESHOLD), BRUTEFORCE_MAX_BACKOFF)
+            rec["until"] = now + delay
+        _failed_attempts[ip] = rec
+        return rec["fails"], rec["until"]
+
+
+def _reset_auth_failures(ip):
+    """Сбросить счётчик после успешной аутентификации с IP."""
+    with _failed_lock:
+        _failed_attempts.pop(ip, None)
+
+
+def _backoff_remaining(ip):
+    """Сколько секунд осталось до конца backoff-окна для IP (0 если можно пускать)."""
+    with _failed_lock:
+        rec = _failed_attempts.get(ip)
+        if not rec:
+            return 0.0
+        return max(0.0, rec["until"] - time.time())
+
 # ---- Уникальный ID хоста (9-значный, сохраняется в %APPDATA%) ----
 
 HOST_CONFIG_DIR = os.path.join(
@@ -359,7 +403,7 @@ def screen_info(streamer):
 
 
 def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=SCALE,
-          codec=CODEC, engine="auto", hw_encoder="auto"):
+          codec=CODEC, engine="auto", hw_encoder="auto", on_auth_ok=None):
     chan = common.SecureChannel(key)
 
     # Рукопожатие: клиент должен прислать корректно зашифрованный HELLO.
@@ -376,6 +420,13 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
     use_video = client_video and video_mod is not None and engine != "tiles"
     LOG(f"[host] клиент аутентифицирован (движок={'H.264' if use_video else 'плитки'}, "
         f"FPS={fps}, качество={quality}, масштаб={scale})")
+    # Сигнал вызывающему: рукопожатие/аутентификация прошли успешно.
+    # Используется direct-режимом для сброса счётчика брутфорса по IP.
+    if on_auth_ok is not None:
+        try:
+            on_auth_ok()
+        except Exception:
+            pass
 
     sender = common.FrameSender(sock, chan)
     streamer = ScreenStreamer(scale=scale, quality=quality, codec=codec)
@@ -389,16 +440,34 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
     pending_monitor = {"v": None}
     incoming_file = {"f": None, "name": None}
 
+    def _allowed_bases():
+        """Каталоги, внутри которых разрешён доступ: домашний + downloads_dir."""
+        bases = list(ALLOWED_BASE_DIRS)
+        if downloads_dir:
+            bases.append(downloads_dir)
+        out = []
+        for b in bases:
+            try:
+                out.append(os.path.normcase(os.path.realpath(os.path.abspath(b))))
+            except (ValueError, OSError):
+                continue
+        return out
+
     def _safe_resolve(requested_path):
         """Resolve a requested path, preventing directory traversal.
-        Returns the real absolute path or None if unsafe."""
+        Возвращает реальный абсолютный путь ТОЛЬКО если он существует и
+        находится ВНУТРИ одного из разрешённых базовых каталогов; иначе None."""
         try:
-            # Normalize and resolve to absolute
             resolved = os.path.realpath(os.path.abspath(requested_path))
-            # Basic sanity: must exist
             if not os.path.exists(resolved):
                 return None
-            return resolved
+            norm = os.path.normcase(resolved)
+            for base in _allowed_bases():
+                # внутри base, если совпадает с base или начинается с base + sep
+                if norm == base or norm.startswith(base + os.sep):
+                    return resolved
+            LOG(f"[host] доступ к пути вне разрешённых каталогов отклонён: {resolved}")
+            return None
         except (ValueError, OSError):
             return None
 
@@ -523,6 +592,12 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                 elif mt == common.MSG_DIR_LIST_REQ:
                     req = common.parse_json(body)
                     req_path = req.get("path", "")
+                    if not ALLOW_FILE_BROWSING:
+                        LOG("[host] DIR_LIST_REQ отклонён: просмотр ФС запрещён")
+                        sender.send_json(common.MSG_DIR_LIST_RESP,
+                                         {"path": req_path, "entries": [],
+                                          "error": "file browsing disabled"})
+                        continue
                     resolved, result = _list_directory(req_path)
                     if resolved is not None:
                         sender.send_json(common.MSG_DIR_LIST_RESP,
@@ -531,6 +606,9 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                         sender.send_json(common.MSG_DIR_LIST_RESP,
                                          {"path": req_path, "entries": [], "error": result})
                 elif mt == common.MSG_FILE_PULL_REQ:
+                    if not ALLOW_FILE_BROWSING:
+                        LOG("[host] FILE_PULL_REQ отклонён: доступ к файлам запрещён")
+                        continue
                     req = common.parse_json(body)
                     _send_file_to_client(req.get("path", ""))
                 else:
@@ -693,11 +771,24 @@ def _run_direct(args, key, params, stop_event):
     cur = {"sock": None, "thread": None}
 
     def _session(conn, addr):
+        ip = addr[0]
+        authed = {"ok": False}
+
+        def _on_auth_ok():
+            authed["ok"] = True
+            _reset_auth_failures(ip)   # успешная аутентификация — сброс счётчика
+
         try:
-            serve(conn, key, args.downloads, **params)
+            serve(conn, key, args.downloads, on_auth_ok=_on_auth_ok, **params)
         except (ConnectionError, socket.error) as e:
+            if not authed["ok"]:
+                fails, until = _record_auth_failure(ip)
+                LOG(f"[host] неудачная аутентификация с {ip} (попыток: {fails})")
             LOG(f"[host] сессия {addr} завершена: {e}")
         except Exception as e:
+            if not authed["ok"]:
+                fails, until = _record_auth_failure(ip)
+                LOG(f"[host] неудачная аутентификация с {ip} (попыток: {fails})")
             LOG(f"[host] сессия {addr} ошибка: {e}")
         finally:
             try:
@@ -723,6 +814,16 @@ def _run_direct(args, key, params, stop_event):
                 continue
             except OSError:
                 break
+            # Брутфорс-защита: если IP в backoff-окне — рвём соединение сразу,
+            # не доводя до handshake (атакующий не может молотить пароли).
+            remaining = _backoff_remaining(addr[0])
+            if remaining > 0:
+                LOG(f"[host] {addr[0]} в backoff ({remaining:.0f}с) — соединение отклонено")
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             common.enable_keepalive(conn)
             _evict()               # вытесняем старую сессию перед запуском новой

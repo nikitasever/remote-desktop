@@ -27,6 +27,7 @@ _ENCODER_PRIORITY = ["h264_nvenc", "h264_amf", "h264_qsv", "h264_vaapi", "libx26
 
 # Приоритет декодеров: аппаратные сначала, софтовый h264 — последним.
 _DECODER_PRIORITY = ["h264_cuvid", "h264_qsv", "h264"]
+_DECODER_OK = {}  # кэш результатов валидации HW-декодеров
 
 # Кэш результатов зондирования доступных энкодеров.
 _available_encoders_cache = None
@@ -175,6 +176,11 @@ class VideoEncoder:
                      self.name, elapsed, sum(len(bytes(p)) for p in pkts))
         except Exception as e:
             log.warning("encoder benchmark failed: %s", e)
+        finally:
+            # Бенчмарк выше съедает стартовый IDR+SPS/PPS из потока энкодера.
+            # Форсируем keyframe, чтобы ПЕРВЫЙ реальный кадр снова нёс заголовки
+            # и опорный кадр — иначе декодер на той стороне падает InvalidData.
+            self._force_key = True
 
     def force_keyframe(self):
         self._force_key = True
@@ -209,6 +215,38 @@ class VideoEncoder:
             pass
 
 
+def _decoder_can_decode(decoder_name: str) -> bool:
+    """Проверяет, что HW-декодер реально декодирует libx264-поток.
+    Кодируем 2 тестовых кадра софтовым libx264 и пытаемся декодировать
+    указанным декодером. True только если получили хотя бы один кадр.
+    Результат кэшируется в _DECODER_OK."""
+    if decoder_name in _DECODER_OK:
+        return _DECODER_OK[decoder_name]
+    ok = False
+    try:
+        import numpy as _np
+        enc = VideoEncoder(160, 128, fps=10)
+        pkts = []
+        for i in range(2):
+            frame = _np.full((128, 160, 3), i * 40, dtype=_np.uint8)
+            pkts.extend(enc.encode(frame) or [])
+        enc.close()
+        cc = av.codec.context.CodecContext.create(decoder_name, "r")
+        cc.open()
+        for data, _kf in pkts:
+            for _frame in cc.decode(av.packet.Packet(data)):
+                ok = True
+        try:
+            cc.close()
+        except Exception:
+            pass
+    except Exception as e:
+        log.debug("decoder %s validation error: %s", decoder_name, e)
+        ok = False
+    _DECODER_OK[decoder_name] = ok
+    return ok
+
+
 class VideoDecoder:
     def __init__(self, prefer="auto"):
         self.name = None
@@ -222,9 +260,19 @@ class VideoDecoder:
         for name in order:
             try:
                 cc = av.codec.context.CodecContext.create(name, "r")
-                # h264_cuvid / h264_qsv нужна проверка: пробуем открыть.
+                # HW-декодер (cuvid/qsv) может «открыться», но не уметь
+                # декодировать реальный поток (Intel HD 4600: qsv открывается,
+                # но libx264-поток не тянет -> 0 кадров). Поэтому валидируем
+                # настоящим тестовым кадром, а не только open().
                 if name != "h264":
                     cc.open()
+                    if not _decoder_can_decode(name):
+                        log.debug("decoder %s opened but failed test decode", name)
+                        try:
+                            cc.close()
+                        except Exception:
+                            pass
+                        continue
                 self.cc = cc
                 self.name = name
                 log.info("decoder selected: %s", name)

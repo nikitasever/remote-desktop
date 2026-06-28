@@ -19,6 +19,79 @@ import argparse
 import json
 import socket
 import threading
+import time
+
+# ---- Rate limiting / brute-force protection (tunable) ----
+RL_WINDOW = 60          # окно отслеживания попыток, сек
+RL_MAX_ATTEMPTS = 10    # > этого числа попыток в окне -> блокировка
+RL_BASE_BLOCK = 30      # базовая длительность блокировки, сек
+RL_MAX_BLOCK = 300      # максимум блокировки (cap), сек = 5 мин
+MAX_CONN_PER_IP = 20    # максимум одновременных соединений с одного IP
+
+# ip -> [timestamps] недавних попыток (CONNECT / room-регистраций)
+_attempts = {}
+# ip -> момент времени, до которого IP заблокирован
+_blocked_until = {}
+_rl_lock = threading.Lock()
+
+# ip -> число активных соединений
+_active_conns = {}
+_active_lock = threading.Lock()
+
+
+def _prune_attempts(ip, now):
+    """Удаляет устаревшие метки времени. Вызывать под _rl_lock."""
+    ts = _attempts.get(ip)
+    if ts is None:
+        return
+    cutoff = now - RL_WINDOW
+    fresh = [t for t in ts if t >= cutoff]
+    if fresh:
+        _attempts[ip] = fresh
+    else:
+        _attempts.pop(ip, None)
+
+
+def check_rate_limit(ip):
+    """Регистрирует попытку с данного IP и решает, не пора ли блокировать.
+    Возвращает (allowed: bool, retry_after: int)."""
+    now = time.time()
+    with _rl_lock:
+        # Периодически чистим словарь блокировок от истёкших записей
+        expired = [k for k, v in _blocked_until.items() if v <= now]
+        for k in expired:
+            _blocked_until.pop(k, None)
+
+        until = _blocked_until.get(ip)
+        if until is not None and until > now:
+            return False, int(until - now) + 1
+
+        _prune_attempts(ip, now)
+        attempts = _attempts.setdefault(ip, [])
+        attempts.append(now)
+
+        over = len(attempts) - RL_MAX_ATTEMPTS
+        if over > 0:
+            # Экспоненциальный backoff по степени превышения, с потолком
+            block = min(RL_BASE_BLOCK * (2 ** (over - 1)), RL_MAX_BLOCK)
+            _blocked_until[ip] = now + block
+            return False, int(block)
+
+        return True, 0
+
+
+def reject_rate_limited(sock, addr, retry_after, what):
+    ip = addr[0]
+    print(f"[relay] RATE-LIMITED {ip} ({what}, retry_after={retry_after}s)")
+    try:
+        sock.sendall(b"ERROR rate_limited\n")
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
 
 # ---- Old room-based protocol ----
 rooms = {}            # session -> {"host": sock, "client": sock}
@@ -226,7 +299,7 @@ def handle_room(sock, addr, role, session):
 
 # ---- Dispatcher ----
 
-def handle(sock, addr):
+def _dispatch(sock, addr):
     try:
         line = read_line(sock)
     except Exception as e:
@@ -234,13 +307,20 @@ def handle(sock, addr):
         sock.close()
         return
 
+    ip = addr[0]
+
     # New protocol: REGISTER <id> or CONNECT <id>
     if line.startswith("REGISTER "):
+        # REGISTER — это host, не вектор brute-force пароля; не лимитируем по попыткам.
         unique_id = line[len("REGISTER "):]
         handle_register(sock, addr, unique_id)
         return
 
     if line.startswith("CONNECT "):
+        allowed, retry_after = check_rate_limit(ip)
+        if not allowed:
+            reject_rate_limited(sock, addr, retry_after, "CONNECT")
+            return
         unique_id = line[len("CONNECT "):]
         handle_connect(sock, addr, unique_id)
         return
@@ -254,7 +334,43 @@ def handle(sock, addr):
         sock.close()
         return
 
+    # Лимитируем клиентов и в старом протоколе (host-регистрации не штрафуем).
+    if role != "host":
+        allowed, retry_after = check_rate_limit(ip)
+        if not allowed:
+            reject_rate_limited(sock, addr, retry_after, "room")
+            return
+
     handle_room(sock, addr, role, session)
+
+
+def handle(sock, addr):
+    """Обёртка диспетчера: учитывает лимит одновременных соединений с IP."""
+    ip = addr[0]
+    with _active_lock:
+        count = _active_conns.get(ip, 0)
+        if count >= MAX_CONN_PER_IP:
+            print(f"[relay] RATE-LIMITED {ip} (concurrent>{MAX_CONN_PER_IP})")
+            try:
+                sock.sendall(b"ERROR rate_limited\n")
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
+        _active_conns[ip] = count + 1
+
+    try:
+        _dispatch(sock, addr)
+    finally:
+        with _active_lock:
+            c = _active_conns.get(ip, 0) - 1
+            if c > 0:
+                _active_conns[ip] = c
+            else:
+                _active_conns.pop(ip, None)
 
 
 def main():

@@ -601,7 +601,11 @@ class LauncherUI:
                                         text_color=TEXT_HINT)
         self.status_text.pack(side="left", padx=(4, 0))
 
-        ctk.CTkLabel(self.footer_frame, text="v1.0", font=ctk.CTkFont(size=11),
+        try:
+            from version import __version__ as _ver
+        except Exception:
+            _ver = "?"
+        ctk.CTkLabel(self.footer_frame, text=f"v{_ver}", font=ctk.CTkFont(size=11),
                      text_color=TEXT_HINT).pack(side="right")
 
     # ================================================================

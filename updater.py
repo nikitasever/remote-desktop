@@ -124,6 +124,7 @@ def apply_update(new_exe_path: str):
     pid = os.getpid()
 
     bat_content = f"""@echo off
+chcp 65001 >NUL
 echo Waiting for old process to exit...
 :wait
 tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL
@@ -131,16 +132,24 @@ if not errorlevel 1 (
     timeout /t 1 /nobreak >NUL
     goto wait
 )
+timeout /t 2 /nobreak >NUL
 echo Replacing exe...
 if exist "{os.path.join(exe_dir, old_name)}" del /f "{os.path.join(exe_dir, old_name)}"
 ren "{current_exe}" "{old_name}"
+if errorlevel 1 goto fail
 move /y "{new_exe_path}" "{current_exe}"
+if errorlevel 1 goto fail
 echo Starting new version...
 start "" "{current_exe}"
+goto cleanup
+:fail
+echo Update failed, restoring...
+if exist "{os.path.join(exe_dir, old_name)}" ren "{os.path.join(exe_dir, old_name)}" "{exe_name}"
+:cleanup
 del "%~f0"
 """
 
-    with open(bat_path, "w", encoding="oem") as f:
+    with open(bat_path, "w", encoding="utf-8-sig") as f:
         f.write(bat_content)
 
     subprocess.Popen(

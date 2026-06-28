@@ -143,12 +143,15 @@ def apply_update(new_exe_path: str):
         "    if (Test-Path $old) { Remove-Item $old -Force }\n"
         "    Rename-Item $cur $old -Force; Log 'Renamed current to old'\n"
         "    Move-Item $new $cur -Force; Log 'Moved new exe in place'\n"
-        "    Start-Process $cur; Log 'Launched new version'\n"
+        # explorer.exe launches the exe in the user's normal session/desktop and
+        # fully detaches it from this hidden helper. Start-Process here leaves the
+        # relaunched windowed exe HANGING at startup (verified) — explorer does not.
+        "    explorer.exe $cur; Log 'Launched new version'\n"
         "} catch {\n"
         "    Log \"FAIL: $_\"\n"
         "    if ((Test-Path $old) -and -not (Test-Path $cur)) {\n"
         "        Rename-Item $old (Split-Path $cur -Leaf) -Force; Log 'Restored old exe'\n"
-        "        Start-Process $cur\n"
+        "        explorer.exe $cur\n"
         "    }\n"
         "}\n"
     )
@@ -158,12 +161,27 @@ def apply_update(new_exe_path: str):
     # NOTE: DETACHED_PROCESS must NOT be used here — PowerShell fails to start
     # without a console. CREATE_NO_WINDOW gives a hidden console and the child
     # survives the parent's os._exit() below.
-    subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        close_fds=True,
-    )
+    #
+    # CRITICAL for PyInstaller --windowed builds: the frozen app has NO console
+    # and its std handles are invalid. subprocess.Popen MUST redirect
+    # stdin/stdout/stderr to DEVNULL, otherwise the child fails to start in the
+    # real exe (it "works" only when launched from a console python). This was
+    # the real reason the updater never relaunched.
+    try:
+        devnull = open(os.devnull, "wb")
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdin=subprocess.DEVNULL,
+            stdout=devnull,
+            stderr=devnull,
+            close_fds=True,
+        )
+    except Exception:
+        # Last-resort fallback: relaunch helper via cmd 'start'.
+        os.system(f'start "" /min powershell -NoProfile -ExecutionPolicy Bypass '
+                  f'-WindowStyle Hidden -EncodedCommand {encoded}')
     os._exit(0)
 
 

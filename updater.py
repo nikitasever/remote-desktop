@@ -140,7 +140,7 @@ start "" "{current_exe}"
 del "%~f0"
 """
 
-    with open(bat_path, "w", encoding="ascii") as f:
+    with open(bat_path, "w", encoding="oem") as f:
         f.write(bat_content)
 
     subprocess.Popen(

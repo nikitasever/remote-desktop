@@ -120,54 +120,46 @@ def apply_update(new_exe_path: str):
     old_name = exe_name.replace(".exe", ".old.exe")
     new_basename = os.path.basename(new_exe_path)
 
-    bat_path = os.path.join(exe_dir, "_update.bat")
+    ps_path = os.path.join(exe_dir, "_update.ps1")
+    log_path = os.path.join(exe_dir, "_update.log")
     pid = os.getpid()
 
-    log_path = os.path.join(exe_dir, "_update.log")
-    bat_content = f"""@echo off
-chcp 65001 >NUL
-set LOG="{log_path}"
-echo [%date% %time%] Update started >> %LOG%
-echo Waiting for PID {pid}... >> %LOG%
-:wait
-tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >NUL
-    goto wait
-)
-echo [%date% %time%] Process exited >> %LOG%
-timeout /t 2 /nobreak >NUL
-if exist "{os.path.join(exe_dir, old_name)}" (
-    del /f "{os.path.join(exe_dir, old_name)}" >> %LOG% 2>&1
-)
-echo [%date% %time%] Renaming current exe... >> %LOG%
-ren "{current_exe}" "{old_name}" >> %LOG% 2>&1
-if errorlevel 1 (
-    echo [%date% %time%] FAIL: ren failed >> %LOG%
-    goto fail
-)
-echo [%date% %time%] Moving new exe... >> %LOG%
-move /y "{new_exe_path}" "{current_exe}" >> %LOG% 2>&1
-if errorlevel 1 (
-    echo [%date% %time%] FAIL: move failed >> %LOG%
-    goto fail
-)
-echo [%date% %time%] Launching... >> %LOG%
-explorer.exe "{current_exe}"
-echo [%date% %time%] Launch command sent >> %LOG%
-goto cleanup
-:fail
-echo [%date% %time%] Restoring old exe >> %LOG%
-if exist "{os.path.join(exe_dir, old_name)}" ren "{os.path.join(exe_dir, old_name)}" "{exe_name}" >> %LOG% 2>&1
-:cleanup
-del "%~f0"
+    ps_content = f"""
+$ErrorActionPreference = 'Stop'
+$log = '{log_path}'
+function Log($msg) {{ "$(Get-Date -Format o) $msg" | Out-File $log -Append -Encoding utf8 }}
+Log 'Update started'
+try {{
+    Log 'Waiting for PID {pid}...'
+    try {{ Wait-Process -Id {pid} -Timeout 30 -ErrorAction Stop }} catch {{}}
+    Start-Sleep -Seconds 2
+    $cur = '{current_exe}'
+    $old = '{os.path.join(exe_dir, old_name)}'
+    $new = '{new_exe_path}'
+    if (Test-Path $old) {{ Remove-Item $old -Force; Log 'Removed old exe' }}
+    Rename-Item $cur $old -Force; Log 'Renamed current to old'
+    Move-Item $new $cur -Force; Log 'Moved new exe in place'
+    Log 'Launching new version...'
+    Start-Process $cur
+    Log 'Done'
+}} catch {{
+    Log "FAIL: $_"
+    $old = '{os.path.join(exe_dir, old_name)}'
+    $cur = '{current_exe}'
+    if ((Test-Path $old) -and -not (Test-Path $cur)) {{
+        Rename-Item $old (Split-Path $cur -Leaf) -Force
+        Log 'Restored old exe'
+    }}
+}}
+Remove-Item '{ps_path}' -Force -ErrorAction SilentlyContinue
 """
 
-    with open(bat_path, "w", encoding="utf-8-sig") as f:
-        f.write(bat_content)
+    with open(ps_path, "w", encoding="utf-8-sig") as f:
+        f.write(ps_content)
 
     subprocess.Popen(
-        ["cmd.exe", "/c", bat_path],
+        ["powershell.exe", "-ExecutionPolicy", "Bypass",
+         "-WindowStyle", "Hidden", "-File", ps_path],
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
         close_fds=True,
     )
@@ -191,7 +183,7 @@ def cleanup_old_update():
     if not is_frozen():
         return
     exe_dir = os.path.dirname(sys.executable)
-    for name in ("app.old.exe", "_update.bat"):
+    for name in ("app.old.exe", "_update.bat", "_update.ps1", "_update.log"):
         path = os.path.join(exe_dir, name)
         try:
             if os.path.exists(path):

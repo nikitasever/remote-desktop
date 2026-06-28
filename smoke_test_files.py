@@ -104,10 +104,17 @@ def _host_side(sock, chan, downloads_dir, test_file_to_send, dir_to_list, done_e
             # --- File pull request (host -> client) ---
             elif mt == common.MSG_FILE_PULL_REQ:
                 req = common.parse_json(body)
-                pull_path = req.get("path", "")
-                # Use the pre-arranged test file
-                fpath = os.path.realpath(os.path.abspath(pull_path))
-                if os.path.isfile(fpath):
+                # Поддержка пакетного "paths" и одиночного "path" (как в host.py).
+                pull_paths = req.get("paths")
+                if not pull_paths:
+                    single = req.get("path", "")
+                    pull_paths = [single] if single else []
+                # Отдаём файлы строго по очереди (как _pull_worker в host.py),
+                # чтобы META/CHUNK/END разных файлов не перемешались.
+                for pull_path in pull_paths:
+                    fpath = os.path.realpath(os.path.abspath(pull_path))
+                    if not os.path.isfile(fpath):
+                        continue
                     size = os.path.getsize(fpath)
                     sender.send_json(common.MSG_HOST_FILE_META,
                                      {"name": os.path.basename(fpath), "size": size})
@@ -412,12 +419,148 @@ def test_empty_dir_listing():
     b.close()
 
 
+def test_multi_client_to_host():
+    """Test 6: client sends SEVERAL files to host in one operation (queued)."""
+    print("6) Client -> Host MULTI-file transfer (queued)")
+    tmp = tempfile.mkdtemp(prefix="rd_ft_multi_c2h_")
+    downloads = os.path.join(tmp, "downloads")
+
+    key = common.derive_key(PW)
+    a, b = socket.socketpair()
+    ca, cb = common.SecureChannel(key), common.SecureChannel(key)
+    done = threading.Event()
+
+    # Несколько файлов с разным содержимым/размером.
+    files = {
+        "multi_a.bin": b"AAAA-" + os.urandom(1000),
+        "multi_b.bin": b"BBBB-" + os.urandom(300 * 1024),  # >1 чанк
+        "multi_c.txt": b"CCCC-small",
+    }
+
+    ht = threading.Thread(target=_host_side, args=(b, cb, downloads, None, tmp, done),
+                          daemon=True)
+    ht.start()
+
+    sender = common.FrameSender(a, ca)
+    # Эмулируем send_files_by_paths: META/CHUNK/END последовательно для каждого.
+    for name, content in files.items():
+        sender.send_json(common.MSG_FILE_META, {"name": name, "size": len(content)})
+        off = 0
+        while off < len(content):
+            sender.send(common.MSG_FILE_CHUNK, content[off:off + 256 * 1024])
+            off += 256 * 1024
+        sender.send(common.MSG_FILE_END)
+
+    time.sleep(0.8)
+    done.set()
+    ht.join(timeout=3)
+
+    all_ok = True
+    for name, content in files.items():
+        target = os.path.join(downloads, name)
+        exists = os.path.exists(target)
+        matches = exists and open(target, "rb").read() == content
+        all_ok = all_ok and matches
+        check(f"file '{name}' received & matches", matches)
+    check("all 3 files transferred sequentially", all_ok)
+
+    a.close()
+    b.close()
+
+
+def test_multi_host_to_client():
+    """Test 7: client pulls SEVERAL files from host in one batched request."""
+    print("7) Host -> Client MULTI-file transfer (batched pull)")
+    tmp = tempfile.mkdtemp(prefix="rd_ft_multi_h2c_")
+    downloads_client = os.path.join(tmp, "client_downloads")
+    os.makedirs(downloads_client, exist_ok=True)
+
+    # Файлы на стороне host.
+    files = {
+        "pull_a.dat": b"PA-" + os.urandom(2000),
+        "pull_b.dat": b"PB-" + os.urandom(400 * 1024),  # >1 чанк
+        "pull_c.dat": b"PC-tiny",
+    }
+    paths = []
+    for name, content in files.items():
+        p = os.path.join(tmp, name)
+        with open(p, "wb") as f:
+            f.write(content)
+        paths.append(p)
+
+    key = common.derive_key(PW)
+    a, b = socket.socketpair()
+    ca, cb = common.SecureChannel(key), common.SecureChannel(key)
+    done = threading.Event()
+
+    ht = threading.Thread(target=_host_side,
+                          args=(b, cb, os.path.join(tmp, "host_dl"), None, tmp, done),
+                          daemon=True)
+    ht.start()
+
+    sender = common.FrameSender(a, ca)
+    # Один пакетный запрос на несколько файлов.
+    sender.send_json(common.MSG_FILE_PULL_REQ, {"paths": paths})
+
+    # Клиент принимает поток META/CHUNK/END для каждого файла по очереди
+    # (как reader_thread в client.py).
+    a.settimeout(5)
+    incoming = {"f": None, "name": None}
+    received = {}  # name -> bytes
+    cur_name = None
+    files_done = 0
+
+    deadline = time.time() + 5
+    while time.time() < deadline and files_done < len(files):
+        try:
+            mt, body = common.recv_frame(a, ca)
+        except socket.timeout:
+            break
+        except (ConnectionError, OSError):
+            break
+
+        if mt == common.MSG_HOST_FILE_META:
+            meta = common.parse_json(body)
+            safe = os.path.basename(meta["name"]) or "file.bin"
+            cur_name = safe
+            incoming["name"] = os.path.join(downloads_client, safe)
+            incoming["f"] = open(incoming["name"], "wb")
+            received[cur_name] = bytearray()
+        elif mt == common.MSG_HOST_FILE_CHUNK:
+            if incoming["f"]:
+                incoming["f"].write(body)
+                received[cur_name].extend(body)
+        elif mt == common.MSG_HOST_FILE_END:
+            if incoming["f"]:
+                incoming["f"].close()
+                incoming["f"] = None
+            files_done += 1
+
+    done.set()
+    ht.join(timeout=3)
+
+    all_ok = True
+    for name, content in files.items():
+        got = bytes(received.get(name, b""))
+        disk = os.path.join(downloads_client, name)
+        on_disk = os.path.exists(disk) and open(disk, "rb").read() == content
+        matches = got == content and on_disk
+        all_ok = all_ok and matches
+        check(f"pulled '{name}' matches (stream & disk)", matches)
+    check("all 3 files pulled sequentially without interleaving", all_ok)
+
+    a.close()
+    b.close()
+
+
 if __name__ == "__main__":
     test_client_to_host()
     test_host_to_client()
     test_directory_listing()
     test_path_safety()
     test_empty_dir_listing()
+    test_multi_client_to_host()
+    test_multi_host_to_client()
 
     total = len(ok)
     passed = sum(1 for x in ok if x)

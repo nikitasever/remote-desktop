@@ -31,6 +31,11 @@ DEFAULTS = {
     "security.allow_unattended": False,
     "security.password_hash": "",
 
+    # Контроль доступа к управлению (роли control/view/blocked по client_id)
+    # Политика для НЕИЗВЕСТНЫХ ID: ask / allow_view / allow_control / deny
+    "access.default_policy": "ask",
+    "access.prompt_timeout_sec": 30,
+
     # Права доступа
     "permissions.allow_clipboard": True,
     "permissions.allow_file_transfer": True,
@@ -50,6 +55,19 @@ DEFAULTS = {
     "display.engine": "auto",
     "display.show_cursor": True,
     "hw_encoder": "auto",
+    "hw_decoder": "auto",   # auto / hw / sw — режим аппаратного декодера на клиенте
+
+    # Рендер-бэкенд клиента (применяется ДО инициализации pygame)
+    # direct3d11 / opengl / software / none
+    "render_backend": "direct3d11",
+    "render_16bit": False,        # быстрый 16-битный рендер (ниже качество)
+    "display.fit_mode": "fit",    # fit (вписать с letterbox) / actual (1:1)
+    "display.smooth_scale": True, # сглаженное масштабирование (иначе быстрое)
+
+    # GPU-апскейл / разрешение потока (PART A/B/C)
+    "display.source_scale": 100,  # % разрешения потока: 100/85/75/50 (хост ужмёт захват)
+    "display.gpu_upscale": True,  # тянуть кадр на GPU клиента (pygame._sdl2 Renderer/Texture)
+    "display.sharpen": 0,         # резкость 0..100 (0 = выкл; moderngl→GPU, иначе CPU unsharp)
 
     # Аудио
     "audio.enabled": False,

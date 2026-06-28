@@ -17,6 +17,7 @@ import ctypes.wintypes
 import io
 import json
 import os
+import queue
 import random
 import socket
 import threading
@@ -76,6 +77,21 @@ try:
 except Exception:
     _dxcam = None
 
+try:
+    import audio as audio_mod    # захват системного звука (опционально)
+except Exception:
+    audio_mod = None
+
+try:
+    import secure_capture as _secure   # захват защищённого стола (UAC/вход), опц.
+except Exception:
+    _secure = None
+
+# Включён ли захват secure desktop (UAC/вход). По умолчанию ВКЛ, но реально
+# работает только когда процесс запущен как SYSTEM (см. install_service_system.ps1);
+# иначе OpenInputDesktop(Winlogon) вернёт None и мы тихо продолжим обычный путь.
+SECURE_DESKTOP = os.environ.get("RD_SECURE_DESKTOP", "1") != "0"
+
 TILE = 128            # размер плитки в пикселях
 # Значения по умолчанию (можно переопределить из GUI/CLI)
 JPEG_QUALITY = 65     # качество JPEG для плиток (30..95), 4:4:4
@@ -85,6 +101,18 @@ CODEC = "auto"        # формат плиток: "auto" | "jpeg" | "png"
 
 # Логгер можно переопределить из GUI (host.LOG = my_func)
 LOG = print
+
+import access_control
+
+# Хук запроса доступа (политика "ask"): GUI ставит host.ACCESS_PROMPT = func.
+# Сигнатура: func(client_id, client_name, timeout) -> dict | None
+#   {"role": "control"/"view"/"deny", "remember": bool} либо None (таймаут/отказ).
+# Если хук не задан (headless / CLI) — диалога нет, работает политика по умолчанию.
+ACCESS_PROMPT = None
+
+# Политика по умолчанию для неизвестных ID. Переопределяется из настроек в run_host.
+ACCESS_DEFAULT_POLICY = access_control.DEFAULT_POLICY
+ACCESS_PROMPT_TIMEOUT = 30
 
 # ---- Безопасность: ограничение доступа к ФС и защита от брутфорса ----
 
@@ -251,6 +279,17 @@ class ScreenStreamer:
         self.codec = codec
         self._dx = None          # активная dxcam-камера (или None -> mss)
         self._init_tid = threading.get_ident()   # поток, создавший mss
+        # Захват защищённого стола (UAC/вход/Ctrl+Alt+Del) — опционально, мягко.
+        self._secure_grab = None
+        self._secure_active = False   # последний кадр был с secure desktop
+        if SECURE_DESKTOP and _secure is not None and _secure.available():
+            try:
+                _secure.LOG = LOG    # направим логи модуля в общий LOG
+                self._secure_grab = _secure.SecureDesktopGrabber()
+                LOG("[host] secure-desktop захват включён (нужны права SYSTEM)")
+            except Exception as e:
+                LOG(f"[host] secure-desktop захват недоступен: {e}")
+                self._secure_grab = None
         self.set_monitor(index)
 
     def _open_dxcam(self, index):
@@ -304,8 +343,46 @@ class ScreenStreamer:
         return np.frombuffer(raw.rgb, dtype=np.uint8).reshape(
             raw.height, raw.width, 3)
 
+    def _try_secure_capture(self):
+        """Если фокус ввода на защищённом столе (UAC/вход/CAD) — снять его через
+        GDI. Возвращает numpy RGB или None. Никогда не бросает наружу.
+
+        Только мониторе 1 (виртуальный экран) — GDI снимает весь дисплей.
+        """
+        if self._secure_grab is None:
+            return None
+        try:
+            name = _secure.get_input_desktop_name()
+            # Если имя получить не удалось (нет прав) ИЛИ это обычный Default —
+            # secure-путь не нужен.
+            if not _secure.is_secure_desktop(name):
+                self._secure_active = False
+                return None
+            arr = self._secure_grab.grab()
+            if arr is None:
+                self._secure_active = False
+                return None
+            self._secure_active = True
+            return arr
+        except Exception as e:
+            LOG(f"[host] secure capture: {e}")
+            self._secure_active = False
+            return None
+
     def capture(self):
         """Кадр (numpy RGB) в потоковом размере, либо None если экран не менялся."""
+        # Приоритет: если фокус ввода на защищённом столе (UAC/вход/CAD),
+        # dxcam/mss отдают «не тот» (Default) или застывший кадр — снимем secure.
+        secure_arr = self._try_secure_capture()
+        if secure_arr is not None:
+            arr = secure_arr
+            if self.scale != 1.0:
+                img = Image.fromarray(arr).resize((self.w, self.h), Image.BILINEAR)
+                arr = np.asarray(img)
+            self._last_arr = arr
+            self._last_emit = time.time()
+            self._last_full = None   # сброс детекта статики: вернулись с secure
+            return arr
         if self._dx is not None:
             try:
                 arr = self._dx.grab()    # None, если кадр не изменился (DXGI)
@@ -351,6 +428,12 @@ class ScreenStreamer:
             except Exception:
                 pass
             self._dx = None
+        if self._secure_grab is not None:
+            try:
+                self._secure_grab.close()
+            except Exception:
+                pass
+            self._secure_grab = None
 
     @staticmethod
     def _is_flat(tile):
@@ -402,8 +485,140 @@ def screen_info(streamer):
             "monitors": streamer.count, "index": streamer.index}
 
 
+def _start_audio_thread(sender, alive):
+    """Запускает фоновый поток захвата+кодирования системного звука и отправки
+    MSG_AUDIO_INFO/MSG_AUDIO. Полностью опционально: при отсутствии audio.py,
+    PyAudioWPatch или loopback-устройства — тихо ничего не делает.
+    Возвращает объект захвата (для остановки) или None."""
+    if audio_mod is None:
+        LOG("[host] аудио недоступно (нет модуля audio/PyAV) — звук не передаётся")
+        return None
+    try:
+        capture = audio_mod.LoopbackCapture()
+    except Exception as e:
+        LOG(f"[host] не удалось инициализировать аудио-захват: {e}")
+        return None
+    if not getattr(capture, "available", False):
+        LOG("[host] loopback-устройство не найдено — звук не передаётся")
+        try:
+            capture.stop()
+        except Exception:
+            pass
+        return None
+
+    def worker():
+        try:
+            encoder = audio_mod.OpusEncoder()
+        except Exception as e:
+            LOG(f"[host] не удалось создать Opus-энкодер: {e}")
+            return
+        try:
+            sender.send_json(common.MSG_AUDIO_INFO, {
+                "sample_rate": audio_mod.SAMPLE_RATE,
+                "channels": audio_mod.CHANNELS,
+                "codec": "opus",
+            })
+            LOG(f"[host] аудио-поток: opus {audio_mod.SAMPLE_RATE} Hz, "
+                f"{audio_mod.CHANNELS} ch")
+        except (ConnectionError, socket.error):
+            return
+        except Exception as e:
+            LOG(f"[host] ошибка отправки AUDIO_INFO: {e}")
+            return
+        while alive["v"]:
+            pcm = capture.read()
+            if pcm is None:
+                time.sleep(audio_mod.FRAME_DURATION / 2)
+                continue
+            try:
+                for pkt in encoder.encode(pcm):
+                    sender.send(common.MSG_AUDIO, pkt)
+            except (ConnectionError, socket.error):
+                break
+            except Exception as e:
+                LOG(f"[host] ошибка кодирования/отправки аудио: {e}")
+                break
+
+    threading.Thread(target=worker, daemon=True).start()
+    return capture
+
+
+def _resolve_access_role(client_id, client_name):
+    """Определить эффективную роль клиента (control/view) или None=отказ.
+
+    Логика:
+      1) Если для client_id задана роль в roles.json — применяем её без вопросов
+         (blocked -> None=отказ).
+      2) Иначе действует политика по умолчанию (ACCESS_DEFAULT_POLICY):
+         allow_view/allow_control -> роль сразу; deny -> None;
+         ask -> показываем GUI-диалог через ACCESS_PROMPT (если он задан).
+         Headless (ACCESS_PROMPT=None) при "ask" -> отказ (decide allow_prompt=False).
+    """
+    try:
+        allow_prompt = ACCESS_PROMPT is not None
+        action, role = access_control.decide(
+            client_id,
+            default_policy=ACCESS_DEFAULT_POLICY,
+            allow_prompt=allow_prompt,
+        )
+    except Exception as e:
+        LOG(f"[host] ошибка контроля доступа (decide): {e}; пускаю как control")
+        return "control"
+
+    if action == "apply":
+        return None if role == "blocked" else role
+    if action == "deny":
+        return None
+    # action == "ask": спрашиваем пользователя через GUI-хук.
+    if ACCESS_PROMPT is None:
+        return None  # на всякий случай (decide уже учёл, но дублируем)
+    try:
+        resp = ACCESS_PROMPT(client_id, client_name or client_id or "ПК",
+                             ACCESS_PROMPT_TIMEOUT)
+    except Exception as e:
+        LOG(f"[host] ошибка диалога доступа: {e}; отказ")
+        return None
+    if not resp:
+        return None  # таймаут / закрыт / отказ
+    chosen = resp.get("role")
+    if chosen == "deny" or chosen not in ("control", "view"):
+        # Запоминаем явный отказ как blocked, если просили запомнить.
+        if resp.get("remember") and client_id:
+            access_control.set_role(client_id, "blocked")
+        return None
+    if resp.get("remember") and client_id:
+        access_control.set_role(client_id, chosen)
+    return chosen
+
+
+def combine_scale(host_scale, source_scale_pct):
+    """Combine the host-local capture scale with a client-requested source_scale
+    (percent, e.g. 100/75/50). Returns the effective capture scale, clamped to a
+    safe range so a malicious/buggy client can't force absurd capture sizes.
+
+    source_scale_pct is treated as a percentage of the host scale; 100 (or any
+    non-positive / missing value) means "no change". The result is clamped to
+    [0.1, 1.0] — we never UPscale on the host (that's the client GPU's job).
+    """
+    try:
+        host_scale = float(host_scale)
+    except (TypeError, ValueError):
+        host_scale = 1.0
+    try:
+        pct = float(source_scale_pct)
+    except (TypeError, ValueError):
+        pct = 100.0
+    if pct <= 0:
+        pct = 100.0
+    eff = host_scale * (pct / 100.0)
+    # Clamp: at least 10% so we always capture *something*; never above host_scale
+    # (and never above 1.0) so source_scale only ever reduces the captured size.
+    upper = min(1.0, max(0.1, host_scale))
+    return max(0.1, min(eff, upper))
+
+
 def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=SCALE,
-          codec=CODEC, engine="auto", hw_encoder="auto", on_auth_ok=None):
+          codec=CODEC, engine="auto", hw_encoder="auto", mute=False, on_auth_ok=None):
     chan = common.SecureChannel(key)
 
     # Рукопожатие: клиент должен прислать корректно зашифрованный HELLO.
@@ -412,10 +627,41 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
         raise ConnectionError("Ожидался HELLO")
     # Новый клиент шлёт JSON {"video": true}; старый — b"hi" (тогда видео off).
     client_video = False
+    client_id = None
+    client_name = None
+    source_scale_pct = 100.0
     try:
-        client_video = bool(common.parse_json(hello_body).get("video"))
+        _hello = common.parse_json(hello_body)
+        client_video = bool(_hello.get("video"))
+        cid = _hello.get("client_id")
+        client_id = cid if isinstance(cid, str) and cid else None
+        cn = _hello.get("client_name")
+        client_name = cn if isinstance(cn, str) and cn else None
+        # Клиентское предпочтение "разрешение потока" (PART A). Хост умножает
+        # на него свой scale и клампит в безопасный диапазон.
+        if "source_scale" in _hello:
+            source_scale_pct = _hello.get("source_scale")
     except Exception:
         client_video = False
+
+    # Эффективный масштаб захвата = host scale * source_scale (клиента), клампится.
+    eff_scale = combine_scale(scale, source_scale_pct)
+    if eff_scale != scale:
+        LOG(f"[host] source_scale={source_scale_pct}% -> масштаб захвата {scale} -> {eff_scale:.3f}")
+    scale = eff_scale
+
+    # --- Контроль доступа: определяем эффективную роль (control/view/blocked) ---
+    access_role = _resolve_access_role(client_id, client_name)
+    if access_role is None:
+        # Отказ (blocked / deny / таймаут диалога / headless без политики).
+        try:
+            common.send_json(sock, chan, common.MSG_ACCESS,
+                             {"role": "blocked", "reason": "Доступ запрещён"})
+        except Exception:
+            pass
+        raise ConnectionError(
+            f"Доступ отклонён для client_id={client_id} ({client_name})")
+    LOG(f"[host] контроль доступа: client_id={client_id} ({client_name}) -> роль '{access_role}'")
     # engine: "auto"/"x264" -> видео (если клиент умеет и PyAV есть); "tiles" -> плитки.
     use_video = client_video and video_mod is not None and engine != "tiles"
     LOG(f"[host] клиент аутентифицирован (движок={'H.264' if use_video else 'плитки'}, "
@@ -429,14 +675,29 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
             pass
 
     sender = common.FrameSender(sock, chan)
+    # Сообщаем клиенту его эффективную роль (UI отразит "только просмотр").
+    try:
+        _reason = "Полный контроль" if access_role == "control" else "Только просмотр"
+        sender.send_json(common.MSG_ACCESS, {"role": access_role, "reason": _reason})
+    except Exception as e:
+        LOG(f"[host] не удалось отправить MSG_ACCESS: {e}")
     streamer = ScreenStreamer(scale=scale, quality=quality, codec=codec)
     injector = InputInjector(streamer.real_w, streamer.real_h)
     sender.send_json(common.MSG_SCREEN_INFO, screen_info(streamer))
 
-    clip = common.ClipboardSync(lambda txt: sender.send_json(common.MSG_CLIPBOARD, {"text": txt}))
+    clip = common.ClipboardSync(
+        lambda txt: sender.send_json(common.MSG_CLIPBOARD, {"text": txt}),
+        lambda png: sender.send(common.MSG_CLIPBOARD_IMAGE, png),
+    )
     clip.start()
 
     alive = {"v": True}
+    # Аудио host -> client (опционально, не ломает сессию при отсутствии).
+    audio_capture = None
+    if mute:
+        LOG("[host] аудио отключено (--mute)")
+    else:
+        audio_capture = _start_audio_thread(sender, alive)
     pending_monitor = {"v": None}
     incoming_file = {"f": None, "name": None}
 
@@ -496,33 +757,64 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
             return None, str(e)
         return resolved, entries
 
-    def _send_file_to_client(path):
-        """Send a file from host to client in a background thread."""
-        def worker():
+    # Очередь запросов на отдачу файлов клиенту (pull). Несколько запросов
+    # подряд (клиент выбрал/выкачивает несколько файлов) обслуживаются ОДНИМ
+    # фоновым потоком строго последовательно: иначе META/CHUNK/END разных файлов
+    # перемешались бы в сокете и клиент записал бы чанки не в тот файл.
+    pull_queue = queue.Queue()
+    pull_worker_started = {"v": False}
+
+    def _stream_one_file_to_client(path):
+        """Отдаёт один файл клиенту. Путь проверяется через path jail
+        (_safe_resolve) — БЕЗ ослабления. Возвращает True при успехе."""
+        try:
+            resolved = _safe_resolve(path)
+            if resolved is None or not os.path.isfile(resolved):
+                LOG(f"[host] запрос файла отклонён: {path}")
+                return False
+            size = os.path.getsize(resolved)
+            name = os.path.basename(resolved)
+            sender.send_json(common.MSG_HOST_FILE_META, {"name": name, "size": size})
+            sent = 0
+            with open(resolved, "rb") as f:
+                while alive["v"]:
+                    chunk = f.read(256 * 1024)
+                    if not chunk:
+                        break
+                    sender.send(common.MSG_HOST_FILE_CHUNK, chunk)
+                    sent += len(chunk)
+            sender.send(common.MSG_HOST_FILE_END)
+            LOG(f"[host] отправлен файл клиенту: {name} ({sent} байт)")
+            return True
+        except (ConnectionError, socket.error, OSError) as e:
+            LOG(f"[host] ошибка отправки файла: {e}")
+            return False
+
+    def _pull_worker():
+        while alive["v"]:
             try:
-                resolved = _safe_resolve(path)
-                if resolved is None or not os.path.isfile(resolved):
-                    LOG(f"[host] запрос файла отклонён: {path}")
-                    return
-                size = os.path.getsize(resolved)
-                name = os.path.basename(resolved)
-                sender.send_json(common.MSG_HOST_FILE_META, {"name": name, "size": size})
-                sent = 0
-                with open(resolved, "rb") as f:
-                    while alive["v"]:
-                        chunk = f.read(256 * 1024)
-                        if not chunk:
-                            break
-                        sender.send(common.MSG_HOST_FILE_CHUNK, chunk)
-                        sent += len(chunk)
-                sender.send(common.MSG_HOST_FILE_END)
-                LOG(f"[host] отправлен файл клиенту: {name} ({sent} байт)")
-            except (ConnectionError, socket.error, OSError) as e:
-                LOG(f"[host] ошибка отправки файла: {e}")
-        threading.Thread(target=worker, daemon=True).start()
+                path = pull_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                _stream_one_file_to_client(path)
+            finally:
+                pull_queue.task_done()
+
+    def _enqueue_file_pull(paths):
+        """Ставит один или несколько путей в очередь на отдачу клиенту."""
+        if isinstance(paths, str):
+            paths = [paths]
+        if not pull_worker_started["v"]:
+            pull_worker_started["v"] = True
+            threading.Thread(target=_pull_worker, daemon=True).start()
+        for p in paths:
+            if p:
+                pull_queue.put(p)
 
     # Приём команд — в отдельном потоке (блокирующее чтение, без частичных кадров).
     _input_count = {"n": 0}
+    _access_blocked = {"n": 0}
 
     def recv_loop():
         LOG("[host] recv_loop: поток стартовал")
@@ -534,6 +826,15 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                     raise
                 except Exception as e:
                     LOG(f"[host] ошибка чтения кадра: {e}")
+                    continue
+                # --- Контроль доступа: для роли "view" отбрасываем управляющие
+                #     сообщения (ввод/файлы/запись буфера). Host НЕ доверяет
+                #     клиенту — enforce здесь, даже если клиент шлёт их сам. ---
+                if access_control.is_control_message(mt, access_role):
+                    _blocked = _access_blocked["n"] = _access_blocked["n"] + 1
+                    if _blocked <= 3 or _blocked % 200 == 0:
+                        LOG(f"[host] view-only: отброшено управляющее 0x{mt:02X} "
+                            f"(#{_blocked})")
                     continue
                 if mt == common.MSG_INPUT:
                     try:
@@ -555,6 +856,8 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                     sender.send(common.MSG_PONG, body)  # отражаем как есть
                 elif mt == common.MSG_CLIPBOARD:
                     clip.on_remote(common.parse_json(body).get("text", ""))
+                elif mt == common.MSG_CLIPBOARD_IMAGE:
+                    clip.on_remote_image(body)
                 elif mt == common.MSG_SET_MONITOR:
                     pending_monitor["v"] = int(common.parse_json(body).get("index", 1))
                 elif mt == common.MSG_FILE_META:
@@ -610,7 +913,13 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
                         LOG("[host] FILE_PULL_REQ отклонён: доступ к файлам запрещён")
                         continue
                     req = common.parse_json(body)
-                    _send_file_to_client(req.get("path", ""))
+                    # Поддержка одиночного "path" и пакетного "paths" (несколько
+                    # файлов одним запросом). Path jail применяется к каждому.
+                    paths = req.get("paths")
+                    if not paths:
+                        single = req.get("path", "")
+                        paths = [single] if single else []
+                    _enqueue_file_pull(paths)
                 else:
                     LOG(f"[host] recv_loop: неизвестный тип 0x{mt:02X}, {len(body)} байт")
         except (ConnectionError, socket.error) as e:
@@ -638,10 +947,12 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
             streamer.w, streamer.h, fps=fps,
             bitrate=video_mod.quality_to_bitrate(quality, streamer.w, streamer.h),
             prefer=prefer)
+        hw_tag = "HW" if enc.is_hardware else "CPU"
         sender.send_json(common.MSG_VIDEO_INFO,
-                         {"codec": enc.name, "w": enc.width, "h": enc.height, "fps": fps})
-        LOG(f"[host] видео-поток: {enc.name} {enc.width}x{enc.height} @ {fps}к/с "
-            f"~{enc.bitrate // 1000} кбит/с")
+                         {"codec": enc.active_encoder_name, "w": enc.width,
+                          "h": enc.height, "fps": fps, "hw": enc.is_hardware})
+        LOG(f"[host] видео-поток: {enc.active_encoder_name} ({hw_tag}) "
+            f"{enc.width}x{enc.height} @ {fps}к/с ~{enc.bitrate // 1000} кбит/с")
         return enc
 
     def _send_initial_frame():
@@ -706,6 +1017,11 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
     finally:
         alive["v"] = False
         clip.stop()
+        if audio_capture is not None:
+            try:
+                audio_capture.stop()
+            except Exception:
+                pass
         if encoder:
             encoder.close()
         streamer.close()
@@ -852,6 +1168,18 @@ def run_host(args, stop_event=None):
     # unique_id используется только если задан извне (GUI app.py).
     # При CLI-запуске с --id (старый протокол) unique_id остаётся None.
 
+    # Подтягиваем политику контроля доступа из настроек (если доступны).
+    global ACCESS_DEFAULT_POLICY, ACCESS_PROMPT_TIMEOUT
+    try:
+        from settings_config import config as _scfg
+        ACCESS_DEFAULT_POLICY = access_control.normalize_policy(
+            _scfg.get("access.default_policy", access_control.DEFAULT_POLICY))
+        ACCESS_PROMPT_TIMEOUT = int(_scfg.get("access.prompt_timeout_sec", 30))
+    except Exception:
+        pass
+    LOG(f"[host] политика доступа по умолчанию: {ACCESS_DEFAULT_POLICY}"
+        + (" (есть GUI-диалог)" if ACCESS_PROMPT else " (headless)"))
+
     key = common.derive_key(args.password)
     params = dict(
         quality=getattr(args, "quality", JPEG_QUALITY),
@@ -860,6 +1188,7 @@ def run_host(args, stop_event=None):
         codec=getattr(args, "codec", CODEC),
         engine=getattr(args, "engine", "auto"),
         hw_encoder=getattr(args, "hw_encoder", "auto"),
+        mute=getattr(args, "mute", False),
     )
     LOG(f"[host] принятые файлы будут сохраняться в: {args.downloads}")
     if args.relay:
@@ -884,6 +1213,8 @@ def main():
     ap.add_argument("--codec", default=CODEC, choices=["auto", "jpeg", "png"], help="Формат плиток (фолбэк)")
     ap.add_argument("--engine", default="auto", choices=["auto", "x264", "tiles"],
                     help="Движок: auto/x264 — видео H.264; tiles — старые плитки")
+    ap.add_argument("--mute", action="store_true",
+                    help="Не передавать системный звук host'а клиенту")
     args = ap.parse_args()
     if not args.listen and not args.relay:
         ap.error("укажите --listen ПОРТ или --relay vps:порт")

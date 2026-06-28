@@ -26,8 +26,17 @@ AVAILABLE = True
 _ENCODER_PRIORITY = ["h264_nvenc", "h264_amf", "h264_qsv", "h264_vaapi", "libx264"]
 
 # Приоритет декодеров: аппаратные сначала, софтовый h264 — последним.
+# Windows: d3d11va/dxva2 — это hwaccel поверх софт-декодера h264; пробуем их
+# через отдельный механизм (см. _open_hwaccel_decoder). Плюс отдельный
+# полноценный HW-декодер h264_qsv (Intel) и h264_cuvid (NVIDIA).
 _DECODER_PRIORITY = ["h264_cuvid", "h264_qsv", "h264"]
-_DECODER_OK = {}  # кэш результатов валидации HW-декодеров
+# Аппаратные hwaccel-методы PyAV/FFmpeg (DirectX на Windows).
+_HWACCEL_METHODS = ["d3d11va", "dxva2"]
+_DECODER_OK = {}  # кэш результатов валидации HW-декодеров (по ключу-имени)
+
+# Множество имён, считающихся аппаратными декодерами (для active_decoder_name).
+_HW_DECODER_NAMES = set(["h264_cuvid", "h264_qsv"] +
+                        ["h264/" + m for m in _HWACCEL_METHODS])
 
 # Кэш результатов зондирования доступных энкодеров.
 _available_encoders_cache = None
@@ -160,6 +169,16 @@ class VideoEncoder:
         # Бенчмарк: кодируем один тестовый кадр и логируем время.
         self._benchmark()
 
+    @property
+    def active_encoder_name(self):
+        """Имя реально задействованного энкодера (например 'h264_qsv' или 'libx264')."""
+        return self.name
+
+    @property
+    def is_hardware(self):
+        """True, если задействован аппаратный энкодер."""
+        return bool(self.name) and self.name != "libx264"
+
     def _benchmark(self):
         """Кодирует один чёрный кадр и логирует время — показывает, работает ли HW."""
         try:
@@ -215,27 +234,63 @@ class VideoEncoder:
             pass
 
 
-def _decoder_can_decode(decoder_name: str) -> bool:
+def _make_test_packets():
+    """Кодирует 2 тестовых кадра libx264 и возвращает список bytes-пакетов."""
+    enc = VideoEncoder(160, 128, fps=10)
+    pkts = []
+    for i in range(2):
+        frame = np.full((128, 160, 3), i * 40, dtype=np.uint8)
+        pkts.extend(enc.encode(frame) or [])
+    enc.close()
+    return [data for data, _kf in pkts]
+
+
+def _open_decoder(name):
+    """Открывает декодер по имени.
+
+    Имена вида 'h264/<hwaccel>' (например 'h264/d3d11va') означают софтовый
+    декодер h264 с аппаратным hwaccel-устройством DirectX. Остальные имена —
+    обычные кодек-контексты (h264, h264_qsv, h264_cuvid).
+
+    Returns: открытый CodecContext.
+    """
+    if "/" in name:
+        codec_name, hwaccel = name.split("/", 1)
+        cc = av.codec.context.CodecContext.create(codec_name, "r")
+        # PyAV >= 10 поддерживает hwaccel через av.codec.hwaccel.HWAccel.
+        try:
+            from av.codec.hwaccel import HWAccel
+            cc.hwaccel = HWAccel(device_type=hwaccel, allow_software_fallback=True)
+        except Exception as e:
+            raise RuntimeError(f"hwaccel {hwaccel} недоступен: {e}")
+        cc.open()
+        return cc
+    cc = av.codec.context.CodecContext.create(name, "r")
+    cc.open()
+    return cc
+
+
+def _decoder_can_decode(decoder_name: str, test_packets=None) -> bool:
     """Проверяет, что HW-декодер реально декодирует libx264-поток.
     Кодируем 2 тестовых кадра софтовым libx264 и пытаемся декодировать
-    указанным декодером. True только если получили хотя бы один кадр.
+    указанным декодером (включая hwaccel-варианты 'h264/d3d11va').
+    True только если получили хотя бы один кадр И смогли перегнать его в RGB
+    ndarray (важно для HW-поверхностей: open() мало, нужна реальная выгрузка).
     Результат кэшируется в _DECODER_OK."""
     if decoder_name in _DECODER_OK:
         return _DECODER_OK[decoder_name]
     ok = False
     try:
-        import numpy as _np
-        enc = VideoEncoder(160, 128, fps=10)
-        pkts = []
-        for i in range(2):
-            frame = _np.full((128, 160, 3), i * 40, dtype=_np.uint8)
-            pkts.extend(enc.encode(frame) or [])
-        enc.close()
-        cc = av.codec.context.CodecContext.create(decoder_name, "r")
-        cc.open()
-        for data, _kf in pkts:
-            for _frame in cc.decode(av.packet.Packet(data)):
-                ok = True
+        if test_packets is None:
+            test_packets = _make_test_packets()
+        cc = _open_decoder(decoder_name)
+        for data in test_packets:
+            for frame in cc.decode(av.packet.Packet(data)):
+                # Доводим до RGB ndarray — это и есть настоящая проверка
+                # (HW-поверхность должна успешно скопироваться в системную память).
+                arr = frame.to_ndarray(format="rgb24")
+                if arr is not None and arr.size > 0:
+                    ok = True
         try:
             cc.close()
         except Exception:
@@ -248,34 +303,52 @@ def _decoder_can_decode(decoder_name: str) -> bool:
 
 
 class VideoDecoder:
+    """H.264-декодер с выбором HW/SW и валидацией-с-фолбэком.
+
+    prefer:
+      'auto' / None / '' — пробуем аппаратные (cuvid/qsv/d3d11va/dxva2), затем софт;
+      'hw'               — то же, но БЕЗ финального софт-фолбэка пропуска валидации
+                           (всё равно если ничего не прошло — берём софт, чтобы не падать);
+      'sw' / 'software' / 'h264' — сразу софтовый h264, без проб HW;
+      <конкретное имя>   — ставим первым в очередь, остальные как фолбэк.
+    """
+
     def __init__(self, prefer="auto"):
         self.name = None
         self.cc = None
 
-        if prefer in (None, "auto", ""):
-            order = list(_DECODER_PRIORITY)
+        if prefer in ("sw", "software", "h264"):
+            order = ["h264"]
+        elif prefer in (None, "auto", "", "hw"):
+            # HW полноценные декодеры + hwaccel-методы DirectX, софт — последним.
+            order = ["h264_cuvid", "h264_qsv"]
+            order += ["h264/" + m for m in _HWACCEL_METHODS]
+            order += ["h264"]
         else:
             order = [prefer] + [d for d in _DECODER_PRIORITY if d != prefer]
 
+        # Один набор тестовых пакетов на все валидации в этом конструкторе.
+        test_packets = None
         for name in order:
             try:
-                cc = av.codec.context.CodecContext.create(name, "r")
-                # HW-декодер (cuvid/qsv) может «открыться», но не уметь
-                # декодировать реальный поток (Intel HD 4600: qsv открывается,
-                # но libx264-поток не тянет -> 0 кадров). Поэтому валидируем
-                # настоящим тестовым кадром, а не только open().
-                if name != "h264":
-                    cc.open()
-                    if not _decoder_can_decode(name):
-                        log.debug("decoder %s opened but failed test decode", name)
-                        try:
-                            cc.close()
-                        except Exception:
-                            pass
-                        continue
-                self.cc = cc
+                if name == "h264":
+                    # Софтовый — не требует валидации, открываем напрямую.
+                    self.cc = _open_decoder("h264")
+                    self.name = "h264"
+                    log.info("decoder selected: h264 (software)")
+                    break
+                # HW-декодер (cuvid/qsv/d3d11va/dxva2) может «открыться», но не
+                # уметь декодировать реальный поток (Intel HD 4600: qsv
+                # открывается, но libx264-поток не тянет -> 0 кадров). Поэтому
+                # валидируем настоящим тестовым кадром, а не только open().
+                if test_packets is None:
+                    test_packets = _make_test_packets()
+                if not _decoder_can_decode(name, test_packets):
+                    log.debug("decoder %s opened but failed test decode", name)
+                    continue
+                self.cc = _open_decoder(name)
                 self.name = name
-                log.info("decoder selected: %s", name)
+                log.info("decoder selected: %s (HW)", name)
                 break
             except Exception as e:
                 log.debug("decoder %s failed: %s", name, e)
@@ -284,8 +357,19 @@ class VideoDecoder:
         if self.cc is None:
             # Аварийный фолбэк — стандартный софтовый декодер.
             self.cc = av.codec.context.CodecContext.create("h264", "r")
+            self.cc.open()
             self.name = "h264"
             log.info("decoder fallback: h264 (software)")
+
+    @property
+    def active_decoder_name(self):
+        """Имя реально задействованного декодера ('h264', 'h264_qsv', 'h264/d3d11va'…)."""
+        return self.name
+
+    @property
+    def is_hardware(self):
+        """True, если задействован аппаратный декодер/hwaccel."""
+        return self.name in _HW_DECODER_NAMES
 
     def decode(self, data: bytes):
         """bytes одного пакета -> список RGB ndarray (0 или 1 кадр)."""

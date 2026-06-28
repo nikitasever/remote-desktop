@@ -208,3 +208,229 @@ class LoopbackAudioTrack(AudioStreamTrack):
         """Вызывается aiortc при закрытии трека."""
         self._cleanup_pa()
         super().stop()
+
+
+# ===========================================================================
+#  TCP-путь (host.py/client.py): независимый Opus-кодек через PyAV.
+#
+#  WebRTC-путь выше использует aiortc, который сам кодирует PCM-кадры в Opus.
+#  TCP-путь aiortc не использует, поэтому здесь — собственные encoder/decoder
+#  поверх PyAV (libopus) и захват loopback в чистом виде (без AudioStreamTrack).
+#  Всё опционально: при отсутствии PyAV/PyAudioWPatch/устройства — graceful no-op.
+# ===========================================================================
+
+
+class OpusEncoder:
+    """Кодирует s16-стерео PCM-кадры (48 kHz, FRAME_SAMPLES сэмплов) в Opus.
+
+    Принимает numpy-массив формы (FRAME_SAMPLES, CHANNELS) dtype int16 и
+    возвращает список bytes (обычно один пакет на кадр)."""
+
+    def __init__(self):
+        self._ctx = av.codec.CodecContext.create("libopus", "w")
+        self._ctx.sample_rate = SAMPLE_RATE
+        self._ctx.format = "s16"
+        self._ctx.layout = "stereo"
+        self._pts = 0
+
+    def encode(self, pcm):
+        frame = av.AudioFrame.from_ndarray(
+            pcm.flatten().reshape(1, -1), format="s16", layout="stereo")
+        frame.sample_rate = SAMPLE_RATE
+        frame.pts = self._pts
+        frame.time_base = _TIME_BASE
+        self._pts += FRAME_SAMPLES
+        return [bytes(p) for p in self._ctx.encode(frame)]
+
+
+class OpusDecoder:
+    """Декодирует Opus-пакеты обратно в numpy int16 (samples, channels)."""
+
+    def __init__(self):
+        self._ctx = av.codec.CodecContext.create("libopus", "r")
+        self._ctx.sample_rate = SAMPLE_RATE
+        self._ctx.format = "s16"
+        self._ctx.layout = "stereo"
+
+    def decode(self, data):
+        out = []
+        packet = av.packet.Packet(data)
+        for frame in self._ctx.decode(packet):
+            arr = frame.to_ndarray()  # (channels, samples) или (1, samples*ch)
+            if arr.ndim == 2 and arr.shape[0] == CHANNELS:
+                arr = arr.T  # -> (samples, channels)
+            else:
+                arr = arr.reshape(-1, CHANNELS)
+            out.append(arr.astype(np.int16))
+        return out
+
+
+class LoopbackCapture:
+    """Захват системного звука (WASAPI loopback) в очередь s16-стерео кадров
+    по FRAME_SAMPLES — для TCP-пути, без aiortc.
+
+    ``available`` = False, если PyAudioWPatch/устройство недоступны — тогда
+    модуль тихо ничего не делает (graceful degradation)."""
+
+    def __init__(self):
+        self._queue: deque = deque(maxlen=_MAX_QUEUE)
+        self._pa = None
+        self._stream = None
+        self._dev_rate = SAMPLE_RATE
+        self._dev_channels = CHANNELS
+        self.available = False
+
+        loopback, pa = _find_loopback_device()
+        if loopback is None:
+            return
+
+        self._pa = pa
+        self._dev_rate = int(loopback["defaultSampleRate"])
+        self._dev_channels = int(loopback["maxInputChannels"])
+        try:
+            import pyaudiowpatch as pyaudio
+            dev_frame = max(256, int(self._dev_rate * FRAME_DURATION))
+            self._stream = pa.open(
+                format=pyaudio.paFloat32,
+                channels=self._dev_channels,
+                rate=self._dev_rate,
+                input=True,
+                input_device_index=int(loopback["index"]),
+                frames_per_buffer=dev_frame,
+                stream_callback=self._callback,
+            )
+            self._stream.start_stream()
+            self.available = True
+            LOG.info("TCP loopback-захват запущен: %s @ %d Hz, %d ch",
+                     loopback["name"], self._dev_rate, self._dev_channels)
+        except Exception as exc:
+            LOG.warning("Не удалось открыть loopback-поток (TCP): %s", exc)
+            self._cleanup_pa()
+
+    def _callback(self, in_data, frame_count, time_info, status):
+        import pyaudiowpatch as pyaudio
+        try:
+            raw = np.frombuffer(in_data, dtype=np.float32)
+            pcm = np.clip(raw, -1.0, 1.0)
+            pcm_s16 = (pcm * 32767).astype(np.int16)
+            arr = _resample_if_needed(pcm_s16, self._dev_rate, self._dev_channels)
+            arr = arr.reshape(-1, CHANNELS)
+            pos = 0
+            n = len(arr)
+            while n - pos >= FRAME_SAMPLES:
+                self._queue.append(arr[pos:pos + FRAME_SAMPLES].copy())
+                pos += FRAME_SAMPLES
+        except Exception:
+            pass
+        return (None, pyaudio.paContinue)
+
+    def read(self):
+        """Один кадр (FRAME_SAMPLES, CHANNELS) int16 или None, если очередь пуста."""
+        if self._queue:
+            return self._queue.popleft()
+        return None
+
+    def _cleanup_pa(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa = None
+
+    def stop(self):
+        self._cleanup_pa()
+
+
+class AudioPlayer:
+    """Воспроизведение принятых Opus-пакетов (TCP-путь, на стороне client).
+
+    Декодирует в отдельном потоке и пишет PCM в WASAPI/обычный output-поток,
+    чтобы не блокировать pygame-цикл. ``available`` = False, если PyAudio/PyAV
+    недоступны — тогда пакеты тихо отбрасываются (graceful degradation)."""
+
+    def __init__(self):
+        self._queue: deque = deque(maxlen=_MAX_QUEUE)
+        self._lock = threading.Lock()
+        self._alive = True
+        self._pa = None
+        self._stream = None
+        self._decoder = None
+        self.available = False
+
+        try:
+            self._decoder = OpusDecoder()
+        except Exception as exc:
+            LOG.warning("Не удалось создать Opus-декодер: %s", exc)
+            return
+
+        try:
+            import pyaudiowpatch as pyaudio
+        except ImportError:
+            try:
+                import pyaudio  # обычный PyAudio тоже подойдёт для вывода
+            except ImportError:
+                LOG.warning("PyAudio недоступен — воспроизведение звука отключено")
+                return
+
+        try:
+            self._pa = pyaudio.PyAudio()
+            self._stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                output=True,
+                frames_per_buffer=FRAME_SAMPLES,
+            )
+            self.available = True
+            threading.Thread(target=self._play_loop, daemon=True).start()
+            LOG.info("Аудио-воспроизведение запущено: %d Hz, %d ch", SAMPLE_RATE, CHANNELS)
+        except Exception as exc:
+            LOG.warning("Не удалось открыть output-поток: %s", exc)
+            self._cleanup_pa()
+
+    def feed(self, packet: bytes):
+        """Принять один Opus-пакет (из MSG_AUDIO). Декодирование — в потоке."""
+        if not self.available:
+            return
+        with self._lock:
+            self._queue.append(packet)
+
+    def _play_loop(self):
+        while self._alive:
+            with self._lock:
+                pkt = self._queue.popleft() if self._queue else None
+            if pkt is None:
+                time.sleep(FRAME_DURATION / 2)
+                continue
+            try:
+                for arr in self._decoder.decode(pkt):
+                    self._stream.write(arr.astype(np.int16).tobytes())
+            except Exception:
+                pass
+
+    def _cleanup_pa(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa = None
+
+    def stop(self):
+        self._alive = False
+        self._cleanup_pa()

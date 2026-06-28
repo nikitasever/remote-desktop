@@ -2,6 +2,8 @@
 
 import customtkinter as ctk
 
+import access_control
+
 
 def create_page(parent, config):
     """Build and return the Security settings frame."""
@@ -90,6 +92,90 @@ def create_page(parent, config):
         font=("Segoe UI", 12), text_color="#eab308",
         anchor="w", wraplength=420, justify="left",
     ).pack(fill="x", padx=32, pady=(2, 4))
+
+    # ── Контроль доступа к управлению (роли по ID) ───────────────────────
+    _section("Права доступа к управлению")
+
+    ctk.CTkLabel(page, text="Политика для НЕИЗВЕСТНЫХ ID при подключении:",
+                 font=NORMAL_FONT, text_color="#9ca3af",
+                 anchor="w").pack(fill="x", padx=32, pady=(0, 4))
+
+    _POLICY_LABELS = {
+        "ask": "Спрашивать каждый раз",
+        "allow_view": "Разрешать только просмотр",
+        "allow_control": "Разрешать полный контроль",
+        "deny": "Отклонять подключение",
+    }
+    _LABEL_TO_POLICY = {v: k for k, v in _POLICY_LABELS.items()}
+
+    cur_policy = access_control.normalize_policy(
+        config.get("access.default_policy", "ask"))
+    policy_var = ctk.StringVar(value=_POLICY_LABELS[cur_policy])
+
+    def _on_policy(choice):
+        config.set("access.default_policy", _LABEL_TO_POLICY.get(choice, "ask"))
+
+    ctk.CTkOptionMenu(
+        page, variable=policy_var,
+        values=list(_POLICY_LABELS.values()),
+        command=_on_policy, font=NORMAL_FONT,
+        fg_color="#1f2937", button_color=ACCENT, button_hover_color="#2563eb",
+        width=300,
+    ).pack(anchor="w", padx=32, pady=(0, 8))
+
+    # ── Менеджер известных ID ────────────────────────────────────────────
+    ctk.CTkLabel(page, text="Известные ID и их роли:",
+                 font=NORMAL_FONT, text_color="#9ca3af",
+                 anchor="w").pack(fill="x", padx=32, pady=(6, 4))
+
+    roles_box = ctk.CTkScrollableFrame(page, fg_color="#0f172a", height=160)
+    roles_box.pack(fill="x", padx=32, pady=(0, 6))
+
+    _ROLE_LABELS = {"control": "Контроль", "view": "Просмотр", "blocked": "Заблокирован"}
+
+    def _refresh_roles():
+        for w in roles_box.winfo_children():
+            w.destroy()
+        table = access_control.load_roles()
+        if not table:
+            ctk.CTkLabel(roles_box, text="Список пуст — ID добавляются при подключении.",
+                         font=("Segoe UI", 12), text_color="#6b7280",
+                         anchor="w").pack(fill="x", padx=8, pady=8)
+            return
+        for cid, role in sorted(table.items()):
+            row = ctk.CTkFrame(roles_box, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=2)
+            ctk.CTkLabel(row, text=cid, font=("Consolas", 12), text_color=TEXT,
+                         width=110, anchor="w").pack(side="left", padx=(4, 8))
+
+            rvar = ctk.StringVar(value=_ROLE_LABELS.get(role, role))
+
+            def _make_setter(client_id):
+                def _set(choice):
+                    inv = {v: k for k, v in _ROLE_LABELS.items()}
+                    access_control.set_role(client_id, inv.get(choice, "view"))
+                return _set
+
+            ctk.CTkOptionMenu(
+                row, variable=rvar, values=list(_ROLE_LABELS.values()),
+                command=_make_setter(cid), font=("Segoe UI", 12), width=140,
+                fg_color="#1f2937", button_color=ACCENT, button_hover_color="#2563eb",
+            ).pack(side="left", padx=(0, 8))
+
+            def _make_remover(client_id):
+                def _rm():
+                    access_control.remove_role(client_id)
+                    _refresh_roles()
+                return _rm
+
+            ctk.CTkButton(row, text="Удалить", width=70, font=("Segoe UI", 12),
+                          fg_color="#374151", hover_color="#4b5563",
+                          command=_make_remover(cid)).pack(side="right", padx=4)
+
+    ctk.CTkButton(page, text="Обновить список", width=140, font=NORMAL_FONT,
+                  fg_color="#374151", hover_color="#4b5563",
+                  command=_refresh_roles).pack(anchor="w", padx=32, pady=(0, 8))
+    _refresh_roles()
 
     # ── Двухфакторная аутентификация ─────────────────────────────────────
     _section("Двухфакторная аутентификация")

@@ -923,6 +923,7 @@ class LauncherUI:
         self._set_status("waiting", "Хост запущен, ожидание…")
         self._host_stop_event = threading.Event()
         host.LOG = lambda *a: self.root.after(0, self._host_log, " ".join(str(x) for x in a))
+        host.ACCESS_PROMPT = self._access_prompt
         threading.Thread(target=host.run_host, args=(args, self._host_stop_event),
                          daemon=True).start()
 
@@ -935,6 +936,76 @@ class LauncherUI:
         """Handle host log messages while in launcher view."""
         # Could show in status bar or a small log panel; for now update status
         self._set_status("connected", msg[:60])
+
+    def _access_prompt(self, client_id, client_name, timeout):
+        """Вызывается из потока host'а при политике 'ask'. Показывает модальный
+        диалог в главном (tkinter) потоке и БЛОКИРУЕТ поток host'а до ответа
+        либо таймаута. Возвращает {"role","remember"} или None (отказ/таймаут)."""
+        result = {"resp": None}
+        done = threading.Event()
+
+        def _show():
+            try:
+                win = ctk.CTkToplevel(self.root)
+                win.title("Запрос подключения")
+                win.geometry("420x230")
+                win.configure(fg_color=BG_DARK)
+                win.transient(self.root)
+                win.attributes("-topmost", True)
+                try:
+                    win.grab_set()
+                except Exception:
+                    pass
+
+                ctk.CTkLabel(
+                    win,
+                    text=f"ПК «{client_name}» запрашивает подключение",
+                    font=ctk.CTkFont(size=15, weight="bold"),
+                    text_color=TEXT_PRIMARY, wraplength=380, justify="left",
+                ).pack(anchor="w", padx=20, pady=(20, 4))
+                ctk.CTkLabel(
+                    win, text=f"ID клиента: {_format_id(client_id) if client_id else '—'}",
+                    font=ctk.CTkFont(size=12), text_color=TEXT_SECONDARY,
+                ).pack(anchor="w", padx=20, pady=(0, 10))
+
+                remember = ctk.BooleanVar(value=False)
+                ctk.CTkCheckBox(win, text="Запомнить для этого ID",
+                                variable=remember, font=ctk.CTkFont(size=12),
+                                text_color=TEXT_SECONDARY).pack(anchor="w", padx=20, pady=(0, 12))
+
+                def _finish(role):
+                    if not done.is_set():
+                        result["resp"] = {"role": role, "remember": bool(remember.get())}
+                        done.set()
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+
+                btns = ctk.CTkFrame(win, fg_color="transparent")
+                btns.pack(fill="x", padx=20, pady=(0, 16))
+                ctk.CTkButton(btns, text="Разрешить управление", fg_color=GREEN,
+                              hover_color=GREEN_DIM,
+                              command=lambda: _finish("control")).pack(side="left", padx=(0, 6))
+                ctk.CTkButton(btns, text="Только просмотр", fg_color=ACCENT,
+                              hover_color=ACCENT_HOVER,
+                              command=lambda: _finish("view")).pack(side="left", padx=6)
+                ctk.CTkButton(btns, text="Отклонить", fg_color=RED,
+                              hover_color="#b91c1c",
+                              command=lambda: _finish("deny")).pack(side="right")
+
+                win.protocol("WM_DELETE_WINDOW", lambda: _finish("deny"))
+            except Exception:
+                if not done.is_set():
+                    result["resp"] = None
+                    done.set()
+
+        self.root.after(0, _show)
+        # Блокируем поток host'а (не главный!) до ответа или таймаута.
+        if not done.wait(timeout=max(1, int(timeout))):
+            # Таймаут: трактуем как отказ; диалог закроется сам при ответе позже.
+            return None
+        return result["resp"]
 
     def _on_connect(self):
         """Connect button in the top bar address field."""

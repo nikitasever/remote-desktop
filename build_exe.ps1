@@ -21,6 +21,15 @@ $verContent = $verContent -replace '__build_date__\s*=\s*"[^"]*"', "__build_date
 $verContent | Set-Content ".\version.py" -Encoding utf8
 Write-Host "Build date: $buildDate" -ForegroundColor Gray
 
+# Если app.exe запущен — он залочит dist\app.exe, PyInstaller молча НЕ перезапишет
+# его, и в релиз уедет старый бинарь. Глушим запущенные копии и удаляем старый exe.
+Get-Process -Name app -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+if (Test-Path ".\dist\app.exe") { Remove-Item ".\dist\app.exe" -Force -ErrorAction SilentlyContinue }
+if (Test-Path ".\dist\app.exe") {
+    Write-Host "ОШИБКА: dist\app.exe залочен (запущен app.exe?). Закройте его." -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
 & $py -m PyInstaller --onefile --windowed --noupx --name app `
     --hidden-import pynput.keyboard._win32 `
@@ -53,9 +62,16 @@ Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
     --hidden-import settings_autostart `
     app.py
 
+# Проверяем, что exe реально свежий (создан в эту сборку), а не остался старым.
 if (Test-Path ".\dist\app.exe") {
-    Write-Host "`nГотово: .\dist\app.exe" -ForegroundColor Green
+    $age = (Get-Date) - (Get-Item ".\dist\app.exe").LastWriteTime
+    if ($age.TotalMinutes -gt 5) {
+        Write-Host "`nОШИБКА: dist\app.exe не обновился (старый файл). Сборка НЕ удалась." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "`nГотово: .\dist\app.exe (свежий)" -ForegroundColor Green
     Write-Host "Скопируйте app.exe на оба ПК и запускайте двойным кликом." -ForegroundColor Yellow
 } else {
     Write-Host "`nСборка не удалась — смотрите вывод выше." -ForegroundColor Red
+    exit 1
 }

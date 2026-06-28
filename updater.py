@@ -3,6 +3,7 @@ Self-update module for remote-desktop.
 Uses GitHub Releases as the update source. Stdlib only.
 """
 
+import base64
 import json
 import os
 import sys
@@ -118,49 +119,49 @@ def apply_update(new_exe_path: str):
     exe_dir = os.path.dirname(current_exe)
     exe_name = os.path.basename(current_exe)
     old_name = exe_name.replace(".exe", ".old.exe")
-    new_basename = os.path.basename(new_exe_path)
-
-    ps_path = os.path.join(exe_dir, "_update.ps1")
+    old_path = os.path.join(exe_dir, old_name)
     log_path = os.path.join(exe_dir, "_update.log")
     pid = os.getpid()
 
-    ps_content = f"""
-$ErrorActionPreference = 'Stop'
-$log = '{log_path}'
-function Log($msg) {{ "$(Get-Date -Format o) $msg" | Out-File $log -Append -Encoding utf8 }}
-Log 'Update started'
-try {{
-    Log 'Waiting for PID {pid}...'
-    try {{ Wait-Process -Id {pid} -Timeout 30 -ErrorAction Stop }} catch {{}}
-    Start-Sleep -Seconds 2
-    $cur = '{current_exe}'
-    $old = '{os.path.join(exe_dir, old_name)}'
-    $new = '{new_exe_path}'
-    if (Test-Path $old) {{ Remove-Item $old -Force; Log 'Removed old exe' }}
-    Rename-Item $cur $old -Force; Log 'Renamed current to old'
-    Move-Item $new $cur -Force; Log 'Moved new exe in place'
-    Log 'Launching new version...'
-    Start-Process $cur
-    Log 'Done'
-}} catch {{
-    Log "FAIL: $_"
-    $old = '{os.path.join(exe_dir, old_name)}'
-    $cur = '{current_exe}'
-    if ((Test-Path $old) -and -not (Test-Path $cur)) {{
-        Rename-Item $old (Split-Path $cur -Leaf) -Force
-        Log 'Restored old exe'
-    }}
-}}
-Remove-Item '{ps_path}' -Force -ErrorAction SilentlyContinue
-"""
+    def _q(path):
+        # PowerShell single-quoted literal: double any embedded single quotes
+        return "'" + path.replace("'", "''") + "'"
 
-    with open(ps_path, "w", encoding="utf-8-sig") as f:
-        f.write(ps_content)
+    # Script is passed via -EncodedCommand (Base64/UTF-16LE) so Cyrillic paths
+    # and quoting never touch the command line — the #1 cause of silent failures.
+    ps_content = (
+        "$ErrorActionPreference = 'Continue'\n"
+        f"$log = {_q(log_path)}\n"
+        "function Log($m) { \"$(Get-Date -Format o) $m\" | Out-File $log -Append -Encoding utf8 }\n"
+        "Log 'Update started'\n"
+        f"$cur = {_q(current_exe)}\n"
+        f"$old = {_q(old_path)}\n"
+        f"$new = {_q(new_exe_path)}\n"
+        "try {\n"
+        f"    try {{ Wait-Process -Id {pid} -Timeout 30 -ErrorAction Stop }} catch {{}}\n"
+        "    Start-Sleep -Seconds 2\n"
+        "    if (Test-Path $old) { Remove-Item $old -Force }\n"
+        "    Rename-Item $cur $old -Force; Log 'Renamed current to old'\n"
+        "    Move-Item $new $cur -Force; Log 'Moved new exe in place'\n"
+        "    Start-Process $cur; Log 'Launched new version'\n"
+        "} catch {\n"
+        "    Log \"FAIL: $_\"\n"
+        "    if ((Test-Path $old) -and -not (Test-Path $cur)) {\n"
+        "        Rename-Item $old (Split-Path $cur -Leaf) -Force; Log 'Restored old exe'\n"
+        "        Start-Process $cur\n"
+        "    }\n"
+        "}\n"
+    )
 
+    encoded = base64.b64encode(ps_content.encode("utf-16-le")).decode("ascii")
+
+    # NOTE: DETACHED_PROCESS must NOT be used here — PowerShell fails to start
+    # without a console. CREATE_NO_WINDOW gives a hidden console and the child
+    # survives the parent's os._exit() below.
     subprocess.Popen(
-        ["powershell.exe", "-ExecutionPolicy", "Bypass",
-         "-WindowStyle", "Hidden", "-File", ps_path],
-        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
+        creationflags=subprocess.CREATE_NO_WINDOW,
         close_fds=True,
     )
     os._exit(0)

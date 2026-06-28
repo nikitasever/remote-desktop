@@ -61,8 +61,17 @@ DEFAULTS = {
     # direct3d11 / opengl / software / none
     "render_backend": "direct3d11",
     "render_16bit": False,        # быстрый 16-битный рендер (ниже качество)
-    "display.fit_mode": "fit",    # fit (вписать с letterbox) / actual (1:1)
+    "display.fit_mode": "fit",    # fit (letterbox) / actual (1:1) / stretch (на всё окно)
     "display.smooth_scale": True, # сглаженное масштабирование (иначе быстрое)
+
+    # AnyDesk-подобная панель «Отображение»
+    # Пресет качества (клиентское предпочтение, влияет на quality/fps хоста через HELLO):
+    # quality / balance / speed
+    "display.quality_preset": "balance",
+    # Удалённый курсор в окне просмотра: off / on / auto (показывать ~1.5с после движения)
+    "display.remote_cursor": "auto",
+    # Запускать новые сеансы в полноэкранном режиме
+    "display.fullscreen": False,
 
     # GPU-апскейл / разрешение потока (PART A/B/C)
     "display.source_scale": 100,  # % разрешения потока: 100/85/75/50 (хост ужмёт захват)

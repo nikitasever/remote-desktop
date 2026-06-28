@@ -42,9 +42,24 @@ _HW_DECODER_NAMES = set(["h264_cuvid", "h264_qsv"] +
 _available_encoders_cache = None
 
 
-def _encoder_options(name):
+def _libx264_preset_for_quality(quality):
+    """Пресет libx264 по качеству: выше качество -> «дороже» пресет (резче).
+    quality>=85 -> veryfast; >=70 -> superfast; иначе ultrafast (самый быстрый)."""
+    try:
+        q = int(quality)
+    except (TypeError, ValueError):
+        return "ultrafast"
+    if q >= 85:
+        return "veryfast"
+    if q >= 70:
+        return "superfast"
+    return "ultrafast"
+
+
+def _encoder_options(name, quality=None):
     if name == "libx264":
-        return {"preset": "ultrafast", "tune": "zerolatency", "g": "120", "bf": "0"}
+        preset = _libx264_preset_for_quality(quality) if quality is not None else "ultrafast"
+        return {"preset": preset, "tune": "zerolatency", "g": "120", "bf": "0"}
     if name == "h264_nvenc":
         return {"preset": "p1", "tune": "ull", "g": "120", "bf": "0", "delay": "0"}
     if name == "h264_qsv":
@@ -126,11 +141,13 @@ def _even(v: int) -> int:
 
 
 class VideoEncoder:
-    def __init__(self, width, height, fps=30, bitrate=6_000_000, prefer="auto"):
+    def __init__(self, width, height, fps=30, bitrate=6_000_000, prefer="auto",
+                 quality=None):
         self.width = _even(width)
         self.height = _even(height)
         self.fps = max(1, int(fps))
         self.bitrate = int(bitrate)
+        self.quality = quality   # для выбора libx264-пресета (резкость)
         self._pts = 0
         self._force_key = False
         self.name = None
@@ -152,7 +169,7 @@ class VideoEncoder:
                 cc.pix_fmt = "yuv420p"
                 cc.time_base = fractions.Fraction(1, self.fps)
                 cc.bit_rate = self.bitrate
-                cc.options = _encoder_options(name)
+                cc.options = _encoder_options(name, self.quality)
                 cc.open()
                 self.cc = cc
                 self.name = name

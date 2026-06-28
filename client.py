@@ -665,6 +665,31 @@ def _draw_rounded_rect(surface, color, rect, radius, alpha=255):
         pygame.draw.rect(surface, color, rect, border_radius=radius)
 
 
+def draw_remote_cursor(surface, frame_rect, norm_x, norm_y):
+    """Рисует маркер удалённого курсора (стрелку) поверх кадра.
+
+    frame_rect = (dx, dy, dw, dh) — куда отрисован кадр в окне;
+    norm_x/norm_y — нормализованное (0..1) положение курсора на удалённом экране.
+    Дёшево: одна заливка многоугольника + контур. Координаты клампятся в кадр.
+    """
+    if norm_x is None or norm_y is None:
+        return
+    dx, dy, dw, dh = frame_rect
+    if dw <= 0 or dh <= 0:
+        return
+    px = dx + int(max(0.0, min(1.0, norm_x)) * dw)
+    py = dy + int(max(0.0, min(1.0, norm_y)) * dh)
+    # Классическая стрелка курсора (точка отсчёта — кончик).
+    pts = [(px, py), (px, py + 16), (px + 4, py + 12),
+           (px + 7, py + 18), (px + 10, py + 16),
+           (px + 6, py + 11), (px + 11, py + 11)]
+    try:
+        pygame.draw.polygon(surface, (255, 255, 255), pts)
+        pygame.draw.polygon(surface, (0, 0, 0), pts, 1)
+    except Exception:
+        pass
+
+
 class _ToolbarButton:
     """A single toolbar button with icon text, label, hover state."""
     def __init__(self, icon, label, action):
@@ -713,13 +738,29 @@ def apply_render_backend(env, backend, want_16bit):
     }
 
 
-def compute_fit_rect(src_w, src_h, dst_w, dst_h, fit_mode="fit"):
-    """Compute the letterboxed destination rect (x, y, w, h) for drawing a
-    src_w×src_h frame into a dst_w×dst_h window.
+def quality_preset_to_qf(preset):
+    """Пресет качества (клиентское предпочтение) -> (quality, fps).
+    Пара отправляется хосту в HELLO; хост клампит их под свои лимиты.
 
-    fit_mode="fit"    -> scale preserving aspect ratio, centered (letterbox).
-    fit_mode="actual" -> 1:1, centered; cropped implicitly by clamping origin
+      quality -> (90, 30)   лучшее качество
+      balance -> (70, 25)   баланс (по умолчанию)
+      speed   -> (55, 30)   ниже качество, но плавно
+    """
+    return {
+        "quality": (90, 30),
+        "balance": (70, 25),
+        "speed": (55, 30),
+    }.get(preset, (70, 25))
+
+
+def compute_fit_rect(src_w, src_h, dst_w, dst_h, fit_mode="fit"):
+    """Compute the destination rect (x, y, w, h) for drawing a src_w×src_h
+    frame into a dst_w×dst_h window.
+
+    fit_mode="fit"     -> scale preserving aspect ratio, centered (letterbox).
+    fit_mode="actual"  -> 1:1, centered; cropped implicitly by clamping origin
                           to keep top-left visible when larger than window.
+    fit_mode="stretch" -> fill the whole window, IGNORING aspect ratio.
     """
     if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
         return (0, 0, 0, 0)
@@ -727,6 +768,9 @@ def compute_fit_rect(src_w, src_h, dst_w, dst_h, fit_mode="fit"):
         x = (dst_w - src_w) // 2
         y = (dst_h - src_h) // 2
         return (x, y, src_w, src_h)
+    if fit_mode == "stretch":
+        # Заполняем всё окно, игнорируя пропорции.
+        return (0, 0, dst_w, dst_h)
     # fit: preserve aspect ratio
     scale = min(dst_w / src_w, dst_h / src_h)
     w = max(1, int(round(src_w * scale)))
@@ -734,6 +778,29 @@ def compute_fit_rect(src_w, src_h, dst_w, dst_h, fit_mode="fit"):
     x = (dst_w - w) // 2
     y = (dst_h - h) // 2
     return (x, y, w, h)
+
+
+REMOTE_CURSOR_AUTO_TIMEOUT = 1.5  # сек: в режиме "auto" курсор виден после движения
+
+
+def remote_cursor_visible(mode, last_move_time, now, timeout=REMOTE_CURSOR_AUTO_TIMEOUT):
+    """Решает, рисовать ли маркер удалённого курсора (чистая логика).
+
+      mode="off"  -> никогда.
+      mode="on"   -> всегда (если было хоть одно положение).
+      mode="auto" -> ~timeout секунд после последнего движения мыши.
+
+    last_move_time=None означает, что положение курсора ещё неизвестно.
+    """
+    if mode == "off":
+        return False
+    if last_move_time is None:
+        return False
+    if mode == "on":
+        return True
+    if mode == "auto":
+        return (now - last_move_time) <= timeout
+    return False
 
 
 class ScaledFrameCache:
@@ -877,6 +944,8 @@ def run_ui(sender, state, clip):
     smooth_scale = True
     gpu_upscale = True
     sharpen = 0
+    start_fullscreen = False
+    remote_cursor_mode = "auto"
     try:
         from settings_config import config as _scfg
         render_backend = _scfg.get("render_backend", "direct3d11")
@@ -885,6 +954,8 @@ def run_ui(sender, state, clip):
         smooth_scale = bool(_scfg.get("display.smooth_scale", True))
         gpu_upscale = bool(_scfg.get("display.gpu_upscale", True))
         sharpen = int(_scfg.get("display.sharpen", 0))
+        start_fullscreen = bool(_scfg.get("display.fullscreen", False))
+        remote_cursor_mode = _scfg.get("display.remote_cursor", "auto")
     except Exception:
         pass
 
@@ -1119,6 +1190,19 @@ def run_ui(sender, state, clip):
     # so the splash animation above keeps presenting via pygame.display.flip().
     _init_gpu_renderer()
 
+    # Полноэкранный старт (PART C): если включено в настройках, переходим в
+    # полноэкранный режим сразу. Выход — Esc / F11 / Ctrl+Alt+F (как обычно).
+    if start_fullscreen and not is_fullscreen:
+        try:
+            _toggle_fullscreen()
+        except Exception as e:
+            log.warning("start fullscreen failed (%s) — windowed", e)
+
+    # Последнее известное нормализованное положение удалённого курсора (0..1)
+    # и время последнего движения — для отрисовки маркера (PART D).
+    remote_cursor_pos = [None, None]
+    remote_cursor_last_move = [0.0]
+
     fade_alpha = 0
 
     def send_input(ev):
@@ -1198,6 +1282,9 @@ def run_ui(sender, state, clip):
                 if not (toolbar_visible and event.pos[1] <= TOOLBAR_H + int(toolbar_y_offset)):
                     x, y = to_norm(event.pos)
                     send_input({"k": "move", "x": x, "y": y})
+                    # Запоминаем позицию удалённого курсора для маркера (PART D).
+                    remote_cursor_pos[0], remote_cursor_pos[1] = x, y
+                    remote_cursor_last_move[0] = now
             elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
                 if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
                         and toolbar_visible and event.pos[1] <= TOOLBAR_H + int(toolbar_y_offset)):
@@ -1304,6 +1391,11 @@ def run_ui(sender, state, clip):
                         fade_alpha = min(fade_alpha + 18, 255)
                 # Overlay surface starts fully transparent each frame.
                 win.fill((0, 0, 0, 0))
+                # Маркер удалённого курсора рисуем на overlay-surface (PART D).
+                if remote_cursor_visible(remote_cursor_mode,
+                                         remote_cursor_last_move[0] or None, now):
+                    draw_remote_cursor(win, (dx, dy, dw, dh),
+                                       remote_cursor_pos[0], remote_cursor_pos[1])
             elif src is not None:
                 ww, wh = win.get_size()
                 sw, sh = src.get_size()
@@ -1328,6 +1420,11 @@ def run_ui(sender, state, clip):
                         fade_alpha = min(fade_alpha + 18, 255)
                     else:
                         win.blit(frame, (dx, dy))
+                # Маркер удалённого курсора поверх кадра (PART D, CPU-путь).
+                if remote_cursor_visible(remote_cursor_mode,
+                                         remote_cursor_last_move[0] or None, now):
+                    draw_remote_cursor(win, (dx, dy, dw, dh),
+                                       remote_cursor_pos[0], remote_cursor_pos[1])
             show = state.show_stats
             fps, kbps, rtt = state.fps, state.kbps, state.rtt_ms
             rtt_age = now - state.rtt_time if state.rtt_time else None
@@ -1525,11 +1622,16 @@ def run_client(args):
     # Клиентское предпочтение разрешения потока (PART A): отправляем хосту,
     # он умножит на свой scale. По умолчанию 100% = без изменений.
     _source_scale = 100
+    _preset = "balance"
     try:
         from settings_config import config as _scfg
         _source_scale = int(_scfg.get("display.source_scale", 100))
+        _preset = _scfg.get("display.quality_preset", "balance")
     except Exception:
         _source_scale = 100
+        _preset = "balance"
+    # Пресет качества -> желаемые quality/fps для хоста (хост клампит их).
+    _pref_quality, _pref_fps = quality_preset_to_qf(_preset)
     try:
         common.send_frame(sock, chan, common.MSG_HELLO,
                           _json.dumps({
@@ -1537,6 +1639,8 @@ def run_client(args):
                               "client_id": get_or_create_client_id(),
                               "client_name": get_client_name(),
                               "source_scale": _source_scale,
+                              "quality": _pref_quality,
+                              "fps": _pref_fps,
                           }).encode("utf-8"))
     except (ConnectionError, socket.error, OSError) as e:
         sock.close()

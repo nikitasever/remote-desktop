@@ -109,9 +109,121 @@ def test_fit_rect():
     # actual mode: 1:1 centered.
     check(client.compute_fit_rect(400, 300, 800, 600, "actual") == (200, 150, 400, 300),
           "actual mode centers 1:1")
+    # stretch mode: fills the whole window, ignoring aspect ratio.
+    check(client.compute_fit_rect(800, 600, 1000, 600, "stretch") == (0, 0, 1000, 600),
+          "stretch fills whole window (aspect ignored)")
+    check(client.compute_fit_rect(1920, 1080, 640, 480, "stretch") == (0, 0, 640, 480),
+          "stretch fills small window too")
+    # fit (default) still letterboxes vs stretch.
+    check(client.compute_fit_rect(800, 600, 1000, 600, "fit") == (100, 0, 800, 600),
+          "fit still letterboxes (regression)")
     # Degenerate inputs.
     check(client.compute_fit_rect(0, 0, 800, 600) == (0, 0, 0, 0),
           "zero src -> empty rect")
+
+
+def test_quality_preset():
+    print("[5] quality_preset_to_qf mapping")
+    check(client.quality_preset_to_qf("quality") == (90, 30), "quality -> (90,30)")
+    check(client.quality_preset_to_qf("balance") == (70, 25), "balance -> (70,25)")
+    check(client.quality_preset_to_qf("speed") == (55, 30), "speed -> (55,30)")
+    check(client.quality_preset_to_qf("bogus") == (70, 25), "unknown -> balance default")
+
+
+def _host_clamp(quality, fps, hello):
+    """Воспроизводит логику host.serve по клампу HELLO quality/fps."""
+    if "quality" in hello:
+        try:
+            quality = max(30, min(95, int(hello.get("quality"))))
+        except (TypeError, ValueError):
+            pass
+    if "fps" in hello:
+        try:
+            fps = max(1, min(int(fps), int(hello.get("fps"))))
+        except (TypeError, ValueError):
+            pass
+    return quality, fps
+
+
+def test_host_clamp():
+    print("[6] host clamps HELLO quality/fps")
+    # cap fps at host's configured value (host fps=20 -> client 30 clamped to 20)
+    q, f = _host_clamp(65, 20, {"quality": 90, "fps": 30})
+    check((q, f) == (90, 20), "fps clamped down to host cap 20")
+    # client fps below cap -> used as-is
+    q, f = _host_clamp(65, 30, {"quality": 70, "fps": 25})
+    check((q, f) == (70, 25), "fps under cap used as-is")
+    # quality clamped to [30,95]
+    q, f = _host_clamp(65, 30, {"quality": 200, "fps": 30})
+    check(q == 95, "quality clamped to 95")
+    q, f = _host_clamp(65, 30, {"quality": 5, "fps": 30})
+    check(q == 30, "quality clamped to 30")
+    # absent fields -> host defaults unchanged (backward-compatible old client)
+    q, f = _host_clamp(65, 20, {})
+    check((q, f) == (65, 20), "absent fields keep host defaults")
+    # garbage values -> ignored, defaults kept
+    q, f = _host_clamp(65, 20, {"quality": "x", "fps": None})
+    check((q, f) == (65, 20), "garbage ignored")
+
+
+def test_remote_cursor():
+    print("[7] remote_cursor_visible decision")
+    now = 1000.0
+    # off -> never
+    check(client.remote_cursor_visible("off", now, now) is False, "off never visible")
+    # on -> always (when a position exists)
+    check(client.remote_cursor_visible("on", now - 99, now) is True, "on always visible")
+    check(client.remote_cursor_visible("on", None, now) is False, "on hidden if no position")
+    # auto -> visible within timeout, hidden after
+    check(client.remote_cursor_visible("auto", now - 1.0, now) is True,
+          "auto visible within 1.5s")
+    check(client.remote_cursor_visible("auto", now - 2.0, now) is False,
+          "auto hidden after 1.5s")
+    check(client.remote_cursor_visible("auto", None, now) is False,
+          "auto hidden if no position yet")
+
+
+def test_encoder_options_preset():
+    print("[8] _encoder_options libx264 preset by quality")
+    import video
+    check(video._encoder_options("libx264", 90)["preset"] == "veryfast",
+          "q90 -> veryfast")
+    check(video._encoder_options("libx264", 85)["preset"] == "veryfast",
+          "q85 -> veryfast")
+    check(video._encoder_options("libx264", 70)["preset"] == "superfast",
+          "q70 -> superfast")
+    check(video._encoder_options("libx264", 55)["preset"] == "ultrafast",
+          "q55 -> ultrafast")
+    check(video._encoder_options("libx264")["preset"] == "ultrafast",
+          "no quality -> ultrafast (backward compat)")
+    opt = video._encoder_options("libx264", 90)
+    check(opt.get("tune") == "zerolatency" and opt.get("g") == "120"
+          and opt.get("bf") == "0", "tune/g/bf preserved")
+
+
+def test_new_config_keys():
+    print("[9] new display config keys round-trip")
+    from settings_config import config
+    keys = ("display.quality_preset", "display.remote_cursor", "display.fullscreen")
+    orig = {k: config.get(k) for k in keys}
+    try:
+        config.set("display.quality_preset", "speed")
+        config.set("display.remote_cursor", "on")
+        config.set("display.fullscreen", True)
+        check(config.get("display.quality_preset") == "speed", "quality_preset persists")
+        check(config.get("display.remote_cursor") == "on", "remote_cursor persists")
+        check(config.get("display.fullscreen") is True, "fullscreen persists")
+        import settings_config as sc
+        fresh = sc.SettingsConfig()
+        check(fresh.get("display.quality_preset") == "speed",
+              "quality_preset survives reload")
+        check(fresh.get("display.fullscreen") is True, "fullscreen survives reload")
+    finally:
+        for k, v in orig.items():
+            if v is None:
+                config.reset(k)
+            else:
+                config.set(k, v)
 
 
 class _FakeSurface:
@@ -157,7 +269,9 @@ def test_scaled_cache():
 
 def main():
     tests = [test_config_roundtrip, test_apply_backend,
-             test_fit_rect, test_scaled_cache]
+             test_fit_rect, test_scaled_cache,
+             test_quality_preset, test_host_clamp, test_remote_cursor,
+             test_encoder_options_preset, test_new_config_keys]
     for t in tests:
         t()
     print("\nALL DISPLAY SMOKE TESTS PASSED")

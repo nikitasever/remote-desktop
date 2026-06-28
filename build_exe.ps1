@@ -31,7 +31,11 @@ if (Test-Path ".\dist\app.exe") {
 }
 
 Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
+# --uac-admin: app.exe запрашивает повышение прав при запуске. Нужно, чтобы
+# хост мог инжектить ввод в окна программ, запущенных от администратора
+# (иначе клики/клавиши не доходят до UAC-elevated окон).
 & $py -m PyInstaller --onefile --windowed --noupx --name app `
+    --uac-admin `
     --hidden-import pynput.keyboard._win32 `
     --hidden-import pynput.mouse._win32 `
     --hidden-import customtkinter `

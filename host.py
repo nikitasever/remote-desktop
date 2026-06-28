@@ -95,7 +95,7 @@ SECURE_DESKTOP = os.environ.get("RD_SECURE_DESKTOP", "1") != "0"
 TILE = 128            # размер плитки в пикселях
 # Значения по умолчанию (можно переопределить из GUI/CLI)
 JPEG_QUALITY = 65     # качество JPEG для плиток (30..95), 4:4:4
-TARGET_FPS = 20       # верхний предел частоты кадров
+TARGET_FPS = 30       # верхний предел частоты кадров
 SCALE = 1.0           # масштаб передаваемого экрана (1.0 / 0.75 / 0.5)
 CODEC = "auto"        # формат плиток: "auto" | "jpeg" | "png"
 
@@ -641,6 +641,18 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
         # на него свой scale и клампит в безопасный диапазон.
         if "source_scale" in _hello:
             source_scale_pct = _hello.get("source_scale")
+        # Пресет качества клиента -> quality/fps. Клампим: fps под лимит хоста,
+        # quality в [30,95]. Старые клиенты без этих полей -> текущие дефолты.
+        if "quality" in _hello:
+            try:
+                quality = max(30, min(95, int(_hello.get("quality"))))
+            except (TypeError, ValueError):
+                pass
+        if "fps" in _hello:
+            try:
+                fps = max(1, min(int(fps), int(_hello.get("fps"))))
+            except (TypeError, ValueError):
+                pass
     except Exception:
         client_video = False
 
@@ -946,7 +958,7 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
         enc = video_mod.VideoEncoder(
             streamer.w, streamer.h, fps=fps,
             bitrate=video_mod.quality_to_bitrate(quality, streamer.w, streamer.h),
-            prefer=prefer)
+            prefer=prefer, quality=quality)
         hw_tag = "HW" if enc.is_hardware else "CPU"
         sender.send_json(common.MSG_VIDEO_INFO,
                          {"codec": enc.active_encoder_name, "w": enc.width,

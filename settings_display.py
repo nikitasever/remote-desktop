@@ -38,35 +38,38 @@ def create_page(parent, config):
         return var
 
     # ── Качество ─────────────────────────────────────────────────────────
+    # Пресет качества — клиентское предпочтение. Через HELLO задаёт хосту
+    # битрейт (quality) и fps. См. client.run_client / host.serve.
     _section("Качество")
     _radios([
-        ("Лучшее качество аудио и видео", "best"),
-        ("Баланс между качеством и откликом", "balanced"),
-        ("Максимальное быстродействие", "performance"),
-    ], "display.quality", "balanced")
+        ("Лучшее качество аудио и видео", "quality"),
+        ("Баланс между качеством и откликом", "balance"),
+        ("Максимальное быстродействие", "speed"),
+    ], "display.quality_preset", "balance")
 
     # ── Визуальные помощники ─────────────────────────────────────────────
     _section("Визуальные помощники")
     _radios([
-        ("Отключить удалённый курсор", "hide"),
-        ("Показать удалённый курсор", "show"),
+        ("Отключить удалённый курсор", "off"),
+        ("Показать удалённый курсор", "on"),
         ("Автоматически показывать удалённый курсор", "auto"),
-    ], "display.cursor_mode", "auto")
+    ], "display.remote_cursor", "auto")
 
     # ── Режим отображения ────────────────────────────────────────────────
+    # Расширяет display.fit_mode: actual / fit / stretch.
     _section("Режим отображения")
     _radios([
-        ("Оригинальный размер", "original"),
-        ("Оптимизировать отображение (сжать)", "shrink"),
+        ("Оригинальный размер", "actual"),
+        ("Оптимизировать отображение (сжать)", "fit"),
         ("Оптимизировать отображение (растянуть)", "stretch"),
-    ], "display.mode", "shrink")
+    ], "display.fit_mode", "fit")
 
     # ── Full Screen Mode ─────────────────────────────────────────────────
     _section("Full Screen Mode")
-    fs_var = ctk.BooleanVar(value=config.get("display.fullscreen_default", False))
+    fs_var = ctk.BooleanVar(value=config.get("display.fullscreen", False))
 
     def _on_fs(*_a):
-        config.set("display.fullscreen_default", fs_var.get())
+        config.set("display.fullscreen", fs_var.get())
 
     fs_var.trace_add("write", _on_fs)
     ctk.CTkCheckBox(page, text="Запускать новые сеансы в полноэкранном режиме",
@@ -74,12 +77,8 @@ def create_page(parent, config):
                     fg_color=ACCENT, hover_color=ACCENT,
                     border_color=TEXT).pack(anchor="w", padx=32, pady=2)
 
-    # ── Режим вписывания / масштабирование ───────────────────────────────
+    # ── Масштабирование окна (плавность) ─────────────────────────────────
     _section("Масштабирование окна")
-    _radios([
-        ("Вписать в окно (с полями)", "fit"),
-        ("1:1 / реальный размер", "actual"),
-    ], "display.fit_mode", "fit")
 
     smooth_var = ctk.BooleanVar(value=config.get("display.smooth_scale", True))
 

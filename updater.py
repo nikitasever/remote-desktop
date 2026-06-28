@@ -202,7 +202,9 @@ def cleanup_old_update():
     if not is_frozen():
         return
     exe_dir = os.path.dirname(sys.executable)
-    for name in ("app.old.exe", "_update.bat", "_update.ps1", "_update.log"):
+    # NB: keep _update.log — it survives the relaunch as a diagnostic trail
+    # ("Launched new version" present == the relaunch step ran).
+    for name in ("app.old.exe", "_update.bat", "_update.ps1"):
         path = os.path.join(exe_dir, name)
         try:
             if os.path.exists(path):

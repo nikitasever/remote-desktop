@@ -123,28 +123,42 @@ def apply_update(new_exe_path: str):
     bat_path = os.path.join(exe_dir, "_update.bat")
     pid = os.getpid()
 
+    log_path = os.path.join(exe_dir, "_update.log")
     bat_content = f"""@echo off
 chcp 65001 >NUL
-echo Waiting for old process to exit...
+set LOG="{log_path}"
+echo [%date% %time%] Update started >> %LOG%
+echo Waiting for PID {pid}... >> %LOG%
 :wait
 tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL
 if not errorlevel 1 (
     timeout /t 1 /nobreak >NUL
     goto wait
 )
+echo [%date% %time%] Process exited >> %LOG%
 timeout /t 2 /nobreak >NUL
-echo Replacing exe...
-if exist "{os.path.join(exe_dir, old_name)}" del /f "{os.path.join(exe_dir, old_name)}"
-ren "{current_exe}" "{old_name}"
-if errorlevel 1 goto fail
-move /y "{new_exe_path}" "{current_exe}"
-if errorlevel 1 goto fail
-echo Starting new version...
-start "" "{current_exe}"
+if exist "{os.path.join(exe_dir, old_name)}" (
+    del /f "{os.path.join(exe_dir, old_name)}" >> %LOG% 2>&1
+)
+echo [%date% %time%] Renaming current exe... >> %LOG%
+ren "{current_exe}" "{old_name}" >> %LOG% 2>&1
+if errorlevel 1 (
+    echo [%date% %time%] FAIL: ren failed >> %LOG%
+    goto fail
+)
+echo [%date% %time%] Moving new exe... >> %LOG%
+move /y "{new_exe_path}" "{current_exe}" >> %LOG% 2>&1
+if errorlevel 1 (
+    echo [%date% %time%] FAIL: move failed >> %LOG%
+    goto fail
+)
+echo [%date% %time%] Launching... >> %LOG%
+explorer.exe "{current_exe}"
+echo [%date% %time%] Launch command sent >> %LOG%
 goto cleanup
 :fail
-echo Update failed, restoring...
-if exist "{os.path.join(exe_dir, old_name)}" ren "{os.path.join(exe_dir, old_name)}" "{exe_name}"
+echo [%date% %time%] Restoring old exe >> %LOG%
+if exist "{os.path.join(exe_dir, old_name)}" ren "{os.path.join(exe_dir, old_name)}" "{exe_name}" >> %LOG% 2>&1
 :cleanup
 del "%~f0"
 """

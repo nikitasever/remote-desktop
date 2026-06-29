@@ -403,13 +403,21 @@ class LauncherUI:
         self.remote_id_entry.pack(side="left", fill="x", expand=True)
 
         self._connect_btn = ctk.CTkButton(
-            addr_inner, text="➜", width=36, height=32,
-            corner_radius=6, font=ctk.CTkFont(size=16, weight="bold"),
+            addr_inner, text="Подключиться  ➜", width=140, height=32,
+            corner_radius=6, font=ctk.CTkFont(size=13, weight="bold"),
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
             text_color="#ffffff",
             command=self._on_connect,
         )
         self._connect_btn.pack(side="right", padx=(4, 0))
+
+        # Подсказка под полем: placeholder у CTkEntry с textvariable не виден,
+        # поэтому даём явный текст — куда вводить и куда жать.
+        self._addr_hint = ctk.CTkLabel(
+            center, text="Введите ID партнёра или адрес и нажмите «Подключиться»",
+            font=ctk.CTkFont(size=11), text_color=TEXT_HINT, anchor="w",
+        )
+        self._addr_hint.pack(fill="x", padx=4, pady=(3, 0))
 
     def _build_id_section(self):
         """Big ID display with animated gradient canvas background."""

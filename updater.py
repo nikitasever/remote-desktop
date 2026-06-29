@@ -3,7 +3,6 @@ Self-update module for remote-desktop.
 Uses GitHub Releases as the update source. Stdlib only.
 """
 
-import base64
 import json
 import os
 import sys
@@ -127,61 +126,63 @@ def apply_update(new_exe_path: str):
         # PowerShell single-quoted literal: double any embedded single quotes
         return "'" + path.replace("'", "''") + "'"
 
-    # Script is passed via -EncodedCommand (Base64/UTF-16LE) so Cyrillic paths
-    # and quoting never touch the command line — the #1 cause of silent failures.
+    # ВАЖНО (антивирус): НЕ используем скрытое окно + base64 -EncodedCommand —
+    # это топ-маркер малвари (PDM/эвристика Kaspersky именно на него и реагирует).
+    # Вместо этого пишем обычный читаемый .ps1 и запускаем его через -File в
+    # МИНИМИЗИРОВАННОМ (не скрытом) окне. Все пути (в т.ч. кириллица) лежат ВНУТРИ
+    # файла как PS-литералы, а сам файл — в %TEMP% (ascii-путь), поэтому в команду
+    # кириллица не попадает (это и был старый баг 'ascii codec'). Файл — UTF-8 с
+    # BOM, чтобы PowerShell корректно прочитал кириллицу в путях.
     ps_content = (
-        "$ErrorActionPreference = 'Continue'\n"
-        f"$log = {_q(log_path)}\n"
-        "function Log($m) { \"$(Get-Date -Format o) $m\" | Out-File $log -Append -Encoding utf8 }\n"
-        "Log 'Update started'\n"
-        f"$cur = {_q(current_exe)}\n"
-        f"$old = {_q(old_path)}\n"
-        f"$new = {_q(new_exe_path)}\n"
-        "try {\n"
-        f"    try {{ Wait-Process -Id {pid} -Timeout 30 -ErrorAction Stop }} catch {{}}\n"
-        "    Start-Sleep -Seconds 2\n"
-        "    if (Test-Path $old) { Remove-Item $old -Force }\n"
-        "    Rename-Item $cur $old -Force; Log 'Renamed current to old'\n"
-        "    Move-Item $new $cur -Force; Log 'Moved new exe in place'\n"
-        # explorer.exe launches the exe in the user's normal session/desktop and
-        # fully detaches it from this hidden helper. Start-Process here leaves the
-        # relaunched windowed exe HANGING at startup (verified) — explorer does not.
-        "    explorer.exe $cur; Log 'Launched new version'\n"
-        "} catch {\n"
-        "    Log \"FAIL: $_\"\n"
-        "    if ((Test-Path $old) -and -not (Test-Path $cur)) {\n"
-        "        Rename-Item $old (Split-Path $cur -Leaf) -Force; Log 'Restored old exe'\n"
-        "        explorer.exe $cur\n"
-        "    }\n"
-        "}\n"
+        "$ErrorActionPreference = 'Continue'\r\n"
+        f"$log = {_q(log_path)}\r\n"
+        "function Log($m) { \"$(Get-Date -Format o) $m\" | Out-File -FilePath $log -Append -Encoding utf8 }\r\n"
+        "Log 'Update started'\r\n"
+        f"$cur = {_q(current_exe)}\r\n"
+        f"$old = {_q(old_path)}\r\n"
+        f"$new = {_q(new_exe_path)}\r\n"
+        f"try {{ Wait-Process -Id {pid} -Timeout 30 -ErrorAction Stop }} catch {{}}\r\n"
+        "Start-Sleep -Seconds 2\r\n"
+        "try {\r\n"
+        "    if (Test-Path $old) { Remove-Item $old -Force }\r\n"
+        "    Rename-Item $cur $old -Force; Log 'Renamed current to old'\r\n"
+        "    Move-Item $new $cur -Force; Log 'Moved new exe in place'\r\n"
+        # explorer.exe запускает exe в обычной сессии/десктопе пользователя и
+        # полностью отвязывает от хелпера. Start-Process оставляет --windowed exe
+        # ВИСЕТЬ на старте (проверено) — explorer нет.
+        "    explorer.exe $cur; Log 'Launched new version'\r\n"
+        "} catch {\r\n"
+        "    Log \"FAIL: $_\"\r\n"
+        "    if ((Test-Path $old) -and -not (Test-Path $cur)) {\r\n"
+        "        Rename-Item $old (Split-Path $cur -Leaf) -Force; Log 'Restored old exe'\r\n"
+        "        explorer.exe $cur\r\n"
+        "    }\r\n"
+        "}\r\n"
+        # хелпер удаляет сам себя из %TEMP% по завершении
+        "try { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force } catch {}\r\n"
     )
 
-    encoded = base64.b64encode(ps_content.encode("utf-16-le")).decode("ascii")
+    helper = os.path.join(tempfile.gettempdir(), "rd_update_helper.ps1")
+    with open(helper, "w", encoding="utf-8-sig") as f:
+        f.write(ps_content)
 
-    # NOTE: DETACHED_PROCESS must NOT be used here — PowerShell fails to start
-    # without a console. CREATE_NO_WINDOW gives a hidden console and the child
-    # survives the parent's os._exit() below.
-    #
-    # CRITICAL for PyInstaller --windowed builds: the frozen app has NO console
-    # and its std handles are invalid. subprocess.Popen MUST redirect
-    # stdin/stdout/stderr to DEVNULL, otherwise the child fails to start in the
-    # real exe (it "works" only when launched from a console python). This was
-    # the real reason the updater never relaunched.
+    # CRITICAL для PyInstaller --windowed: у замороженного app нет консоли и его
+    # std-хэндлы невалидны — subprocess.Popen ОБЯЗАН перенаправить stdin/out/err в
+    # DEVNULL, иначе дочерний процесс не стартует в реальном exe. Окно
+    # минимизировано (видимое, не скрытое) — намеренно, чтобы не походить на малварь.
     try:
         devnull = open(os.devnull, "wb")
         subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-            creationflags=subprocess.CREATE_NO_WINDOW,
+             "-WindowStyle", "Minimized", "-File", helper],
             stdin=subprocess.DEVNULL,
             stdout=devnull,
             stderr=devnull,
             close_fds=True,
         )
     except Exception:
-        # Last-resort fallback: relaunch helper via cmd 'start'.
-        os.system(f'start "" /min powershell -NoProfile -ExecutionPolicy Bypass '
-                  f'-WindowStyle Hidden -EncodedCommand {encoded}')
+        # Запасной путь: запустить хелпер через cmd 'start'.
+        os.system(f'start "" /min powershell -NoProfile -ExecutionPolicy Bypass -File "{helper}"')
     os._exit(0)
 
 

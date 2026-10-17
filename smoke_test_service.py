@@ -182,12 +182,12 @@ def test_ps_scripts_parse():
             continue
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             f"$null=[ScriptBlock]::Create((Get-Content -Raw '{path}'))"],
-            capture_output=True, text=True, timeout=15,
+             f"$null=[ScriptBlock]::Create((Get-Content -Raw -Encoding UTF8 './{name}'))"],
+            cwd=HERE, capture_output=True, text=True, errors="replace", timeout=15,
         )
         check(f"{name} parses OK", result.returncode == 0)
         if result.returncode != 0:
-            print(f"      stderr: {result.stderr[:200]}")
+            print(f"      stderr: {(result.stderr or '')[:200]}")
 
 
 if __name__ == "__main__":

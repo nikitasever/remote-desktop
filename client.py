@@ -1219,7 +1219,13 @@ def run_ui(sender, state, clip):
 
     def to_norm(pos):
         ww, wh = win.get_size()
-        return (max(0.0, min(1.0, pos[0] / ww)), max(0.0, min(1.0, pos[1] / wh)))
+        sw, sh = state.w, state.h
+        dx, dy, dw, dh = compute_fit_rect(sw, sh, ww, wh, fit_mode)
+        if dw <= 0 or dh <= 0:
+            return (max(0.0, min(1.0, pos[0] / max(1, ww))),
+                    max(0.0, min(1.0, pos[1] / max(1, wh))))
+        return (max(0.0, min(1.0, (pos[0] - dx) / dw)),
+                max(0.0, min(1.0, (pos[1] - dy) / dh)))
 
     BTN = {1: "left", 2: "middle", 3: "right"}
     held = {}   # pygame key -> ident
@@ -1514,11 +1520,12 @@ def run_ui(sender, state, clip):
                 bw = btn_w_list[i]
                 by = (TOOLBAR_H - BUTTON_H) // 2
                 btn.rect = pygame.Rect(bx, by + int(toolbar_y_offset), bw, BUTTON_H)
+                draw_rect = pygame.Rect(bx, by, bw, BUTTON_H)
 
                 # Hover highlight
                 if btn.hovered:
                     pygame.draw.rect(tb_surf, (*COL_HOVER, min(toolbar_alpha, 220)),
-                                     btn.rect, border_radius=4)
+                                     draw_rect, border_radius=4)
 
                 # Icon + label
                 icon_surf = font_icon.render(btn.icon, True, COL_TEXT)
@@ -1532,7 +1539,7 @@ def run_ui(sender, state, clip):
                 # Disconnect button: red accent on hover
                 if btn.label == "Disconnect" and btn.hovered:
                     pygame.draw.rect(tb_surf, (*COL_RED, 60),
-                                     btn.rect, border_radius=4)
+                                     draw_rect, border_radius=4)
 
                 bx += bw + btn_pad
 

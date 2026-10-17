@@ -33,6 +33,7 @@ SECURE DESKTOP CAPTURE — захват «защищённого рабочег�
 
 import ctypes
 from ctypes import wintypes
+import threading
 
 import numpy as np
 
@@ -209,6 +210,73 @@ def is_secure_desktop(name):
     return n == "winlogon" or n.startswith("secure")
 
 
+_tls = threading.local()
+
+
+def ensure_input_desktop():
+    """Привязать текущий поток к активному input-desktop (Default или Winlogon).
+
+    Безопасно вызывать многократно из любого потока: десктоп открывается и
+    привязывается через SetThreadDesktop, а дескриптор кэшируется в TLS потока.
+    Это необходимо как для Winlogon/UAC, так и для фоновых/сервисных потоков,
+    чтобы dxcam (DXGI), mss (GDI BitBlt) и pynput (SendInput) имели доступ к экрану.
+    """
+    if not _AVAILABLE:
+        return None
+    hdesk = None
+    try:
+        access = (DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW |
+                  DESKTOP_CREATEMENU | DESKTOP_HOOKCONTROL |
+                  DESKTOP_WRITEOBJECTS | DESKTOP_ENUMERATE |
+                  DESKTOP_SWITCHDESKTOP)
+        hdesk = _user32.OpenInputDesktop(0, True, access)
+        if not hdesk:
+            return getattr(_tls, "hdesk", None)
+        name = _desktop_name(hdesk)
+        prev_hdesk = getattr(_tls, "hdesk", None)
+        prev_name = getattr(_tls, "name", None)
+        if prev_hdesk and prev_name == name:
+            try:
+                _user32.CloseDesktop(hdesk)
+            except Exception:
+                pass
+            return prev_hdesk
+        if _user32.SetThreadDesktop(hdesk):
+            if prev_hdesk:
+                try:
+                    _user32.CloseDesktop(prev_hdesk)
+                except Exception:
+                    pass
+            _tls.hdesk = hdesk
+            _tls.name = name
+            return hdesk
+        else:
+            try:
+                _user32.CloseDesktop(hdesk)
+            except Exception:
+                pass
+            return prev_hdesk
+    except Exception:
+        if hdesk:
+            try:
+                _user32.CloseDesktop(hdesk)
+            except Exception:
+                pass
+        return getattr(_tls, "hdesk", None)
+
+
+if _AVAILABLE and not getattr(threading.Thread.run, "_rd_desktop_patched", False):
+    _orig_thread_run = threading.Thread.run
+
+    def _patched_thread_run(self):
+        ensure_input_desktop()
+        return _orig_thread_run(self)
+
+    _patched_thread_run._rd_desktop_patched = True
+    threading.Thread.run = _patched_thread_run
+    ensure_input_desktop()
+
+
 class SecureDesktopGrabber:
     """Захват КАДРА с input-desktop через переключение потока + GDI BitBlt.
 
@@ -230,7 +298,7 @@ class SecureDesktopGrabber:
         self.last_desktop_name = None
         if _AVAILABLE:
             try:
-                # Запомним «родной» рабочий стол потока, чтобы вернуться.
+                ensure_input_desktop()
                 self._orig_desktop = _user32.GetThreadDesktop(
                     _kernel32.GetCurrentThreadId())
             except Exception:
@@ -239,30 +307,18 @@ class SecureDesktopGrabber:
     def _attach_input_desktop(self):
         """Открыть input-desktop и привязать к нему текущий поток.
 
-        Возвращает HDESK (его НАДО закрыть после) или None.
+        Возвращает HDESK или None.
         """
-        access = (DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW |
-                  DESKTOP_CREATEMENU | DESKTOP_HOOKCONTROL |
-                  DESKTOP_WRITEOBJECTS | DESKTOP_ENUMERATE |
-                  DESKTOP_SWITCHDESKTOP)
-        hdesk = _user32.OpenInputDesktop(0, True, access)
-        if not hdesk:
-            # Частый случай у не-SYSTEM процесса: доступа к Winlogon нет.
-            return None
-        self.last_desktop_name = _desktop_name(hdesk)
-        if not _user32.SetThreadDesktop(hdesk):
-            try:
-                _user32.CloseDesktop(hdesk)
-            except Exception:
-                pass
-            return None
-        return hdesk
+        hdesk = ensure_input_desktop()
+        if hdesk:
+            self.last_desktop_name = getattr(_tls, "name", None) or _desktop_name(hdesk)
+            return hdesk
+        return None
 
     def grab(self):
         """Снимок текущего input-desktop как numpy RGB или None."""
         if not _AVAILABLE:
             return None
-        hdesk = None
         hdc_screen = None
         hdc_mem = None
         hbmp = None
@@ -325,20 +381,8 @@ class SecureDesktopGrabber:
             if hdc_screen:
                 try: _gdi32.DeleteDC(hdc_screen)
                 except Exception: pass
-            # Вернём поток на родной рабочий стол (важно для чистоты).
-            if self._orig_desktop:
-                try: _user32.SetThreadDesktop(self._orig_desktop)
-                except Exception: pass
-            if hdesk:
-                try: _user32.CloseDesktop(hdesk)
-                except Exception: pass
 
     def close(self):
-        if self._orig_desktop and _AVAILABLE:
-            try:
-                _user32.SetThreadDesktop(self._orig_desktop)
-            except Exception:
-                pass
         self._orig_desktop = None
 
 

@@ -117,8 +117,12 @@ def load_config():
 def save_config(data):
     try:
         os.makedirs(APP_DIR, exist_ok=True)
+        existing = load_config()
+        if not isinstance(existing, dict):
+            existing = {}
+        existing.update(data)
         with open(CONFIG, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(existing, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -230,6 +234,12 @@ class LauncherUI:
         self._build_tab_bar()
         self._build_tab_content()
         self._build_footer()
+
+        if lan_discovery is not None and hasattr(lan_discovery, "start_service"):
+            try:
+                lan_discovery.start_service(host_id=self.host_id)
+            except Exception:
+                pass
 
         self._switch_tab("recent")
 
@@ -752,17 +762,33 @@ class LauncherUI:
         is_fav = getattr(session, "is_favorite", False)
         star = "★" if is_fav else "☆"
         star_color = YELLOW if is_fav else TEXT_HINT
-        ctk.CTkLabel(inner, text=star, font=ctk.CTkFont(size=16),
-                     text_color=star_color, width=20).pack(side="right")
+        star_lbl = ctk.CTkLabel(inner, text=star, font=ctk.CTkFont(size=16),
+                                text_color=star_color, width=20, cursor="hand2")
+        star_lbl.pack(side="right")
 
         # Hover effect
         card.bind("<Enter>", lambda e, c=card: self._animate_card_hover(c, True))
         card.bind("<Leave>", lambda e, c=card: self._animate_card_hover(c, False))
 
-        # Click to connect
+        # Click to connect (excluding star label)
         card.bind("<Button-1>", lambda e, s=session: self._connect_to_session(s))
+        inner.bind("<Button-1>", lambda e, s=session: self._connect_to_session(s))
         for child in inner.winfo_children():
+            if child is star_lbl:
+                continue
             child.bind("<Button-1>", lambda e, s=session: self._connect_to_session(s))
+            for subchild in child.winfo_children():
+                subchild.bind("<Button-1>", lambda e, s=session: self._connect_to_session(s))
+        star_lbl.bind("<Button-1>", lambda e, s=session: self._toggle_session_favorite(s))
+
+    def _toggle_session_favorite(self, session):
+        sid = str(getattr(session, "id", ""))
+        if sid and session_history is not None and hasattr(session_history, "toggle_favorite"):
+            try:
+                session_history.toggle_favorite(sid)
+            except Exception:
+                pass
+            self._switch_tab(self._active_tab.get())
 
     def _device_card(self, device):
         """Render a discovered LAN device card."""
@@ -805,6 +831,11 @@ class LauncherUI:
         card.bind("<Leave>", lambda e, c=card: self._animate_card_hover(c, False))
 
         card.bind("<Button-1>", lambda e, d=device: self._connect_to_device(d))
+        inner.bind("<Button-1>", lambda e, d=device: self._connect_to_device(d))
+        for child in inner.winfo_children():
+            child.bind("<Button-1>", lambda e, d=device: self._connect_to_device(d))
+            for subchild in child.winfo_children():
+                subchild.bind("<Button-1>", lambda e, d=device: self._connect_to_device(d))
 
     # ================================================================
     #  ACTIONS
@@ -1017,16 +1048,25 @@ class LauncherUI:
 
     def _on_connect(self):
         """Connect button in the top bar address field."""
-        remote = self.remote_id.get().replace(" ", "").strip()
+        remote = self.remote_id.get().strip()
         if not remote:
             messagebox.showwarning("Подключение",
                                    "Введите ID удалённого ПК.")
             return
-        self._do_client_connect(remote)
+        cleaned = remote.replace(" ", "")
+        if ":" in cleaned or ("." in cleaned and not cleaned.isdigit()):
+            self._do_direct_connect(cleaned)
+        else:
+            self._do_client_connect(cleaned)
 
     def _connect_to_session(self, session):
         sid = str(getattr(session, "id", ""))
-        if sid:
+        if not sid:
+            return
+        if ":" in sid or ("." in sid and not sid.isdigit()):
+            self.remote_id.set(sid)
+            self._do_direct_connect(sid)
+        else:
             self.remote_id.set(_format_id(sid))
             self._do_client_connect(sid)
 
@@ -1034,13 +1074,16 @@ class LauncherUI:
         did = str(getattr(device, "id", ""))
         ip = getattr(device, "ip", "")
         port = getattr(device, "port", "")
-        if did:
+        if did and self.address.get().strip():
             self.remote_id.set(_format_id(did))
             self._do_client_connect(did)
         elif ip:
             addr = f"{ip}:{port}" if port else ip
             self.remote_id.set(addr)
             self._do_direct_connect(addr)
+        elif did:
+            self.remote_id.set(_format_id(did))
+            self._do_client_connect(did)
 
     def _launch_client_process(self, args):
         """Run the client viewer in a SEPARATE process so pygame never shares a
@@ -1067,6 +1110,7 @@ class LauncherUI:
         except OSError:
             pass
 
+        devnull = None
         try:
             devnull = open(os.devnull, "wb")
             p = subprocess.Popen(
@@ -1079,6 +1123,12 @@ class LauncherUI:
             messagebox.showerror("Ошибка подключения", str(e), parent=self.root)
             self._set_status("error", str(e)[:60])
             return
+        finally:
+            if devnull is not None:
+                try:
+                    devnull.close()
+                except OSError:
+                    pass
 
         self._set_status("connected", "Сессия активна")
         self._poll_client_process(p, err_path)
@@ -1116,6 +1166,13 @@ class LauncherUI:
                                    "Укажите пароль.")
             return
         self._persist()
+        if session_history is not None and hasattr(session_history, "record_connection"):
+            try:
+                session_history.record_connection(remote)
+                if self._active_tab.get() == "recent":
+                    self._switch_tab("recent")
+            except Exception:
+                pass
         args = Args(password=pw, relay=addr, unique_id=remote)
         self._set_status("waiting", "Подключение…")
         self._launch_client_process(args)
@@ -1128,6 +1185,13 @@ class LauncherUI:
                                    "Укажите пароль.")
             return
         self._persist()
+        if session_history is not None and hasattr(session_history, "record_connection"):
+            try:
+                session_history.record_connection(addr, name=addr)
+                if self._active_tab.get() == "recent":
+                    self._switch_tab("recent")
+            except Exception:
+                pass
         args = Args(password=pw, connect=addr)
         self._set_status("waiting", "Подключение…")
         self._launch_client_process(args)

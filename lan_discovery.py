@@ -39,6 +39,13 @@ class DiscoveredDevice:
     def is_online(self) -> bool:
         return (time.time() - self.last_seen) < ONLINE_TIMEOUT
 
+    def get(self, key: str, default=None):
+        if key == "online":
+            return self.is_online
+        if key == "favorite":
+            return False
+        return getattr(self, key, default)
+
 
 class DiscoveryService:
     """
@@ -211,3 +218,36 @@ class DiscoveryService:
 
         with self._lock:
             self._devices[dev.id] = dev
+
+
+_default_service: DiscoveryService | None = None
+_default_lock = threading.Lock()
+
+
+def start_service(host_id: str = "000000000", host_name: str | None = None,
+                  port: int = DEFAULT_PORT, service_port: int = 5800,
+                  version: str = "1.0.0") -> DiscoveryService:
+    global _default_service
+    with _default_lock:
+        if _default_service is None:
+            _default_service = DiscoveryService(
+                host_id=host_id, host_name=host_name,
+                port=port, service_port=service_port, version=version,
+            )
+            _default_service.start()
+        return _default_service
+
+
+def stop_service() -> None:
+    global _default_service
+    with _default_lock:
+        if _default_service is not None:
+            _default_service.stop()
+            _default_service = None
+
+
+def get_discovered() -> list[DiscoveredDevice]:
+    with _default_lock:
+        if _default_service is None:
+            return []
+        return _default_service.get_discovered()

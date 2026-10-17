@@ -337,8 +337,13 @@ class ClipboardSync:
     def _img_hash(png_bytes):
         if not png_bytes:
             return None
-        # Дёшево: длина + hash() — достаточно, чтобы заметить смену картинки.
-        return (len(png_bytes), hash(png_bytes))
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            raw = img.tobytes()
+            return (img.size, hash(raw))
+        except Exception:
+            return (len(png_bytes), hash(png_bytes))
 
     def start(self):
         # Поток нужен, если доступен хотя бы текст или картинки.

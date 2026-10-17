@@ -23,6 +23,11 @@ import socket
 import threading
 import time
 
+try:
+    import secure_capture as _secure   # до user32/pynput/mss, чтобы SetThreadDesktop сработал
+except Exception:
+    _secure = None
+
 import numpy as np
 import mss as mss_module
 from PIL import Image
@@ -271,6 +276,8 @@ class ScreenStreamer:
     """
 
     def __init__(self, index=1, scale=1.0, quality=JPEG_QUALITY, codec=CODEC):
+        if _secure is not None and hasattr(_secure, "ensure_input_desktop"):
+            _secure.ensure_input_desktop()
         self.sct = mss_module.MSS()
         # monitors[0] — все экраны вместе; monitors[1:] — по одному.
         self.count = len(self.sct.monitors) - 1
@@ -303,6 +310,8 @@ class ScreenStreamer:
                 pass
             self._dx = None
         try:
+            if _secure is not None and hasattr(_secure, "ensure_input_desktop"):
+                _secure.ensure_input_desktop()
             # index 1 -> первичный выход (output_idx=None); прочие -> index-1
             out_idx = None if index <= 1 else index - 1
             cam = _dxcam.create(output_idx=out_idx, output_color="RGB",
@@ -330,6 +339,8 @@ class ScreenStreamer:
 
     def _ensure_mss(self):
         """Re-create mss if called from a different thread (GDI thread-affinity)."""
+        if _secure is not None and hasattr(_secure, "ensure_input_desktop"):
+            _secure.ensure_input_desktop()
         tid = threading.get_ident()
         if tid != self._init_tid:
             self.sct = mss_module.MSS()
@@ -339,9 +350,16 @@ class ScreenStreamer:
     def _mss_grab(self):
         """Grab via mss with thread-safety: re-create handle if needed."""
         self._ensure_mss()
-        raw = self.sct.grab(self.mon)
-        return np.frombuffer(raw.rgb, dtype=np.uint8).reshape(
-            raw.height, raw.width, 3)
+        try:
+            raw = self.sct.grab(self.mon)
+            return np.frombuffer(raw.rgb, dtype=np.uint8).reshape(
+                raw.height, raw.width, 3)
+        except Exception:
+            if self._secure_grab is not None:
+                arr = self._secure_grab.grab()
+                if arr is not None:
+                    return arr
+            raise
 
     def _try_secure_capture(self):
         """Если фокус ввода на защищённом столе (UAC/вход/CAD) — снять его через
@@ -410,12 +428,19 @@ class ScreenStreamer:
             self._last_arr = arr
             self._last_emit = time.time()
         else:
-            arr = self._mss_grab()
+            try:
+                arr = self._mss_grab()
+            except Exception as e:
+                LOG(f"[host] mss.grab() ошибка: {e}")
+                return None
             # быстрый детект статики по прорежённому кадру (каждый 4-й пиксель)
+            now = time.time()
             fh = hash(arr[::4, ::4].tobytes())
-            if fh == self._last_full:
+            if fh == self._last_full and (now - self._last_emit < 0.5):
                 return None              # ничего не изменилось — не тратим CPU/сеть
             self._last_full = fh
+            self._last_arr = arr
+            self._last_emit = now
         if self.scale != 1.0:
             img = Image.fromarray(arr).resize((self.w, self.h), Image.BILINEAR)
             arr = np.asarray(img)
@@ -552,13 +577,17 @@ def _resolve_access_role(client_id, client_name):
       2) Иначе действует политика по умолчанию (ACCESS_DEFAULT_POLICY):
          allow_view/allow_control -> роль сразу; deny -> None;
          ask -> показываем GUI-диалог через ACCESS_PROMPT (если он задан).
-         Headless (ACCESS_PROMPT=None) при "ask" -> отказ (decide allow_prompt=False).
+         Headless/CLI/service (ACCESS_PROMPT=None) при "ask" -> фолбэк на
+         allow_control (клиент уже прошёл аутентификацию по паролю сессии).
     """
     try:
         allow_prompt = ACCESS_PROMPT is not None
+        eff_policy = ACCESS_DEFAULT_POLICY
+        if not allow_prompt and eff_policy == "ask":
+            eff_policy = "allow_control"
         action, role = access_control.decide(
             client_id,
-            default_policy=ACCESS_DEFAULT_POLICY,
+            default_policy=eff_policy,
             allow_prompt=allow_prompt,
         )
     except Exception as e:
@@ -571,7 +600,7 @@ def _resolve_access_role(client_id, client_name):
         return None
     # action == "ask": спрашиваем пользователя через GUI-хук.
     if ACCESS_PROMPT is None:
-        return None  # на всякий случай (decide уже учёл, но дублируем)
+        return "control"
     try:
         resp = ACCESS_PROMPT(client_id, client_name or client_id or "ПК",
                              ACCESS_PROMPT_TIMEOUT)
@@ -687,15 +716,15 @@ def serve(sock, key, downloads_dir, quality=JPEG_QUALITY, fps=TARGET_FPS, scale=
             pass
 
     sender = common.FrameSender(sock, chan)
+    streamer = ScreenStreamer(scale=scale, quality=quality, codec=codec)
+    injector = InputInjector(streamer.real_w, streamer.real_h)
+    sender.send_json(common.MSG_SCREEN_INFO, screen_info(streamer))
     # Сообщаем клиенту его эффективную роль (UI отразит "только просмотр").
     try:
         _reason = "Полный контроль" if access_role == "control" else "Только просмотр"
         sender.send_json(common.MSG_ACCESS, {"role": access_role, "reason": _reason})
     except Exception as e:
         LOG(f"[host] не удалось отправить MSG_ACCESS: {e}")
-    streamer = ScreenStreamer(scale=scale, quality=quality, codec=codec)
-    injector = InputInjector(streamer.real_w, streamer.real_h)
-    sender.send_json(common.MSG_SCREEN_INFO, screen_info(streamer))
 
     clip = common.ClipboardSync(
         lambda txt: sender.send_json(common.MSG_CLIPBOARD, {"text": txt}),
@@ -1073,6 +1102,7 @@ def _run_relay(args, key, params, stop_event):
     """Relay-режим: реконнект-цикл. Вытеснение старой роли делает сам relay
     (см. relay.py), а keepalive ускоряет обнаружение мёртвой стороны."""
     while not (stop_event and stop_event.is_set()):
+        sock = None
         try:
             sock = make_socket(args)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -1083,6 +1113,15 @@ def _run_relay(args, key, params, stop_event):
         except KeyboardInterrupt:
             LOG("\n[host] выход")
             return
+        except Exception as e:
+            LOG(f"[host] ошибка сессии: {e}. Переподключение через 2с...")
+            time.sleep(2)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
 
 def _run_direct(args, key, params, stop_event):

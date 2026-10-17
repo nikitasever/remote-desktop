@@ -165,8 +165,8 @@ class SettingsWindow(ctk.CTkToplevel):
         self._content_area = ctk.CTkFrame(container, fg_color=BG_DARK, corner_radius=0)
         self._content_area.pack(side="left", fill="both", expand=True)
 
-        # Внутренний фрейм с отступами
-        self._content_inner = ctk.CTkFrame(self._content_area, fg_color="transparent")
+        # Внутренний прокручиваемый фрейм с отступами
+        self._content_inner = ctk.CTkScrollableFrame(self._content_area, fg_color="transparent")
         self._content_inner.pack(fill="both", expand=True, padx=28, pady=24)
 
     def _build_sidebar_nav(self):

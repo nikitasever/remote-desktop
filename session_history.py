@@ -22,6 +22,13 @@ class SessionRecord:
     is_favorite: bool = False
     connection_count: int = 0
 
+    def get(self, key: str, default=None):
+        if key == "favorite":
+            return self.is_favorite
+        if key == "online":
+            return False
+        return getattr(self, key, default)
+
 
 APP_DIR = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")),
@@ -145,3 +152,44 @@ class SessionHistory:
 
         with open(self._config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+_default_history: Optional[SessionHistory] = None
+_default_lock = threading.Lock()
+
+
+def _get_default() -> SessionHistory:
+    global _default_history
+    with _default_lock:
+        if _default_history is None:
+            _default_history = SessionHistory()
+        return _default_history
+
+
+def record_connection(id: str, name: Optional[str] = None, os: Optional[str] = None) -> SessionRecord:
+    return _get_default().record_connection(id=id, name=name, os=os)
+
+
+def get_recent(limit: int = 20) -> List[SessionRecord]:
+    return _get_default().get_recent(limit=limit)
+
+
+def get_favorites() -> List[SessionRecord]:
+    return _get_default().get_favorites()
+
+
+def toggle_favorite(id: str) -> bool:
+    h = _get_default()
+    try:
+        return h.toggle_favorite(id)
+    except KeyError:
+        h.record_connection(id)
+        return h.toggle_favorite(id)
+
+
+def rename_session(id: str, new_name: str) -> None:
+    _get_default().rename_session(id, new_name)
+
+
+def remove_session(id: str) -> None:
+    _get_default().remove_session(id)

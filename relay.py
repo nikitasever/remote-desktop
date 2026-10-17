@@ -214,13 +214,9 @@ def handle_register(sock, addr, unique_id):
                 print(f"[relay] ID '{unique_id}' client disconnected, host waiting")
 
             start_pipe(sock, client_sock, cleanup_cb=cleanup)
-
-            # После отключения клиента проверяем, не вытеснили ли нас
-            with registry_lock:
-                current = registry.get(unique_id)
-                if current is not entry:
-                    return
-                # Хост жив — ждём нового клиента (цикл продолжается)
+            # start_pipe закрывает оба сокета (host и client); хост переподключится
+            # новым REGISTER, поэтому выходим и очищаем запись в finally.
+            return
     except (ConnectionError, OSError):
         pass
     finally:

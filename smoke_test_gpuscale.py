@@ -108,6 +108,5 @@ check("default sharpen 0", config.get("display.sharpen") in (0, "0"))
 print()
 if _failures:
     print(f"FAILED ({len(_failures)}): {_failures}")
-    sys.exit(1)
+    raise Exception(f"FAILED ({len(_failures)}): {_failures}")
 print("ALL PASSED")
-sys.exit(0)

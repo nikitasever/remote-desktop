@@ -39,29 +39,35 @@ import common
 
 # ---- Win32 SendInput для надёжного перемещения мыши (drag/выделение) ----
 
-class _MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", ctypes.wintypes.LONG), ("dy", ctypes.wintypes.LONG),
-                ("mouseData", ctypes.wintypes.DWORD), ("dwFlags", ctypes.wintypes.DWORD),
-                ("time", ctypes.wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+if os.name == 'nt':
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", ctypes.wintypes.LONG), ("dy", ctypes.wintypes.LONG),
+                    ("mouseData", ctypes.wintypes.DWORD), ("dwFlags", ctypes.wintypes.DWORD),
+                    ("time", ctypes.wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
 
-class _INPUT(ctypes.Structure):
-    class _U(ctypes.Union):
-        _fields_ = [("mi", _MOUSEINPUT)]
-    _anonymous_ = ("u",)
-    _fields_ = [("type", ctypes.wintypes.DWORD), ("u", _U)]
+    class _INPUT(ctypes.Structure):
+        class _U(ctypes.Union):
+            _fields_ = [("mi", _MOUSEINPUT)]
+        _anonymous_ = ("u",)
+        _fields_ = [("type", ctypes.wintypes.DWORD), ("u", _U)]
 
-_INPUT_MOUSE = 0
-_MOUSEEVENTF_MOVE = 0x0001
-_MOUSEEVENTF_ABSOLUTE = 0x8000
-_SendInput = ctypes.windll.user32.SendInput
+    _INPUT_MOUSE = 0
+    _MOUSEEVENTF_MOVE = 0x0001
+    _MOUSEEVENTF_ABSOLUTE = 0x8000
+    _SendInput = ctypes.windll.user32.SendInput
 
 
-def _move_mouse_abs(px, py):
+def _move_mouse_abs(px, py, mouse=None):
     """Перемещает мышь через SendInput (MOUSEEVENTF_MOVE | ABSOLUTE).
     В отличие от SetCursorPos (который использует pynput mouse.position),
     SendInput генерирует полноценный input-event: Windows учитывает
     состояние зажатых кнопок и посылает WM_MOUSEMOVE с правильными флагами.
     Без этого drag-выделение текста не работает."""
+    if os.name != 'nt':
+        if mouse:
+            mouse.position = (px, py)
+        return
+
     sx = ctypes.windll.user32.GetSystemMetrics(0) or 1
     sy = ctypes.windll.user32.GetSystemMetrics(1) or 1
     ax = int(px * 65535 / sx)
@@ -246,9 +252,9 @@ class InputInjector:
         kind = ev.get("k")
         try:
             if kind == "move":
-                _move_mouse_abs(int(ev["x"] * self.w), int(ev["y"] * self.h))
+                _move_mouse_abs(int(ev["x"] * self.w), int(ev["y"] * self.h), mouse=self.mouse)
             elif kind in ("down", "up"):
-                _move_mouse_abs(int(ev["x"] * self.w), int(ev["y"] * self.h))
+                _move_mouse_abs(int(ev["x"] * self.w), int(ev["y"] * self.h), mouse=self.mouse)
                 btn = {"left": Button.left, "right": Button.right, "middle": Button.middle}.get(ev["btn"])
                 if btn:
                     (self.mouse.press if kind == "down" else self.mouse.release)(btn)

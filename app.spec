@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['pynput.keyboard._win32', 'pynput.mouse._win32', 'customtkinter', 'pygame', 'pygame._sdl2', 'pygame.display', 'pygame.event', 'host_ui', 'video', 'audio', 'adaptive', 'rtc_common', 'host_rtc', 'client_rtc', 'service', 'cv2', 'settings_ui', 'settings_config', 'settings_display', 'settings_interface', 'settings_security', 'settings_connection', 'settings_audio', 'settings_autostart']
+hiddenimports = ['pynput.keyboard._win32', 'pynput.mouse._win32', 'customtkinter', 'pygame', 'pygame._sdl2', 'pygame.display', 'pygame.event', 'host_ui', 'video', 'audio', 'adaptive', 'rtc_common', 'host_rtc', 'client_rtc', 'service', 'cv2', 'settings_ui', 'settings_config', 'settings_display', 'settings_interface', 'settings_security', 'settings_connection', 'settings_audio', 'settings_autostart', 'session_history', 'lan_discovery', 'updater', 'secure_capture', 'access_control']
 hiddenimports += collect_submodules('pygame')
 hiddenimports += collect_submodules('mss')
 hiddenimports += collect_submodules('customtkinter')

@@ -1595,8 +1595,8 @@ def make_socket(args):
             if "not_found" in resp:
                 s.close()
                 raise ConnectionError(
-                    f"Хост с ID {unique_id} не найден.\n"
-                    f"Убедитесь, что хост запущен и подключён к relay.")
+                    f"Хост с ID {unique_id} не найден на relay {args.relay}.\n"
+                    f"Убедитесь, что хост запущен и подключён к этому же relay ({args.relay}).")
             if resp.startswith("ERROR"):
                 s.close()
                 raise ConnectionError(f"Relay отклонил подключение: {resp}")

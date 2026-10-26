@@ -64,7 +64,7 @@ def create_page(parent, config):
     # ── Relay-сервер ────────────────────────────────────────
     row = section_header(frame, "Relay-сервер", row)
 
-    relay_var = ctk.StringVar(value=config.get("connection.relay_address", "77.110.98.222:5810"))
+    relay_var = ctk.StringVar(value=config.get("connection.relay_address", "185.221.196.212:5810"))
     ctk.CTkLabel(frame, text="Адрес relay:", text_color=TEXT).grid(
         row=row, column=0, sticky="w", padx=20, pady=4)
     ctk.CTkEntry(frame, textvariable=relay_var, width=220).grid(

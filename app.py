@@ -42,6 +42,7 @@ except ImportError:
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RemoteDesktop")
 CONFIG = os.path.join(APP_DIR, "config.json")
 DEFAULT_DOWNLOADS = os.path.join(os.path.expanduser("~"), "RemoteDesktop_received")
+DEFAULT_RELAY = "185.221.196.212:5810"
 
 # -- Color palette --
 BG_DARK = "#111827"       # main background
@@ -210,6 +211,12 @@ class LauncherUI:
         self.role = tk.StringVar(value=cfg.get("role", "client"))
         self.conn = tk.StringVar(value=cfg.get("conn", "relay"))
         self.address = tk.StringVar(value=cfg.get("address", ""))
+        addr_val = self.address.get().strip()
+        if not addr_val or "77.110.98.222" in addr_val:
+            addr_val = DEFAULT_RELAY
+            self.address.set(addr_val)
+            save_config({"address": addr_val})
+        self.address.trace_add("write", lambda *_: self._on_address_changed())
         self.remote_id = tk.StringVar(value=cfg.get("remote_id", ""))
         self.password = tk.StringVar(value=cfg.get("password", ""))
         self.downloads = tk.StringVar(value=cfg.get("downloads", DEFAULT_DOWNLOADS))
@@ -247,6 +254,9 @@ class LauncherUI:
         self._start_gradient_animation()
         self._start_id_pulse()
         self._start_connect_pulse()
+
+        if self._hosting.get():
+            self.root.after(300, self._start_hosting)
 
     # ================================================================
     #  DECORATIVE ANIMATIONS
@@ -386,7 +396,7 @@ class LauncherUI:
             corner_radius=8, font=ctk.CTkFont(size=18),
             fg_color=BG_INPUT, hover_color=BORDER,
             text_color=TEXT_SECONDARY,
-            command=lambda: settings_ui.open_settings(self.root),
+            command=self._open_settings,
         )
         settings_btn.pack(side="left")
 
@@ -880,6 +890,32 @@ class LauncherUI:
             pass
         self._update_pw_strength()
 
+    def _open_settings(self):
+        win = settings_ui.open_settings(self.root)
+        def on_close():
+            try:
+                from settings_config import config as _scfg
+                new_addr = _scfg.get("connection.relay_address", "").strip()
+                if new_addr and new_addr != self.address.get().strip():
+                    self.address.set(new_addr)
+                    self._persist()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+    def _on_address_changed(self):
+        val = self.address.get().strip()
+        if val:
+            try:
+                from settings_config import config as _scfg
+                _scfg.set("connection.relay_address", val)
+            except Exception:
+                pass
+
     def _on_update(self):
         if updater is None:
             return
@@ -1155,7 +1191,7 @@ class LauncherUI:
             messagebox.showwarning("Подключение",
                                    "ID должен состоять из 9 цифр.")
             return
-        addr = self.address.get().strip()
+        addr = self.address.get().strip() or DEFAULT_RELAY
         pw = self.password.get()
         if not addr:
             messagebox.showwarning("Подключение",
@@ -1202,7 +1238,7 @@ class LauncherUI:
 
     def _build_host_args(self):
         """Build Args for hosting mode."""
-        addr = self.address.get().strip()
+        addr = self.address.get().strip() or DEFAULT_RELAY
         pw = self.password.get()
         if not addr:
             raise ValueError("Укажите адрес relay.")
@@ -1231,7 +1267,7 @@ class LauncherUI:
         """Legacy _build_args for compatibility."""
         role = self.role.get()
         is_relay = self.conn.get() == "relay"
-        addr = self.address.get().strip()
+        addr = self.address.get().strip() or DEFAULT_RELAY
         pw = self.password.get()
         if not addr:
             raise ValueError("Укажите адрес/порт.")
@@ -1482,7 +1518,10 @@ def _run_host_headless():
         except (TypeError, ValueError):
             a.listen = 5900
     else:
-        a.relay = cfg.get("address", "").strip()
+        relay_val = cfg.get("address", "").strip()
+        if not relay_val or "77.110.98.222" in relay_val:
+            relay_val = DEFAULT_RELAY
+        a.relay = relay_val
         a.unique_id = host_id
         if not a.relay:
             print("[host-headless] нет адреса relay в конфиге")

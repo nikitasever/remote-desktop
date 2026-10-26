@@ -21,7 +21,7 @@ DEFAULTS = {
     "ui.start_with_windows": False,
 
     # Соединение
-    "connection.relay_address": "",
+    "connection.relay_address": "185.221.196.212:5810",
     "connection.auto_reconnect": True,
     "connection.reconnect_delay_sec": 5,
     "connection.timeout_sec": 30,
@@ -105,6 +105,8 @@ class SettingsConfig:
                 self._data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             self._data = {}
+        if not self._data.get("connection.relay_address") or "77.110.98.222" in self._data.get("connection.relay_address", ""):
+            self._data["connection.relay_address"] = "185.221.196.212:5810" 
 
     def _save(self):
         try:

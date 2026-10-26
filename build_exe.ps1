@@ -94,6 +94,11 @@ Write-Host "`nСобираю app.exe..." -ForegroundColor Cyan
     --hidden-import settings_connection `
     --hidden-import settings_audio `
     --hidden-import settings_autostart `
+    --hidden-import session_history `
+    --hidden-import lan_discovery `
+    --hidden-import updater `
+    --hidden-import secure_capture `
+    --hidden-import access_control `
     app.py
 
 # Проверяем, что exe реально свежий (создан в эту сборку), а не остался старым.

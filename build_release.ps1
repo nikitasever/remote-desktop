@@ -1,4 +1,4 @@
-﻿# Сборка релиза: собирает exe и создаёт GitHub Release.
+# Сборка релиза: собирает exe и создаёт GitHub Release.
 # Требует: gh CLI (https://cli.github.com), авторизованный в GitHub.
 # Запуск:  powershell -ExecutionPolicy Bypass -File build_release.ps1
 
@@ -27,7 +27,11 @@ if (-not (Test-Path ".\dist\app.exe")) {
 
 # Создаём GitHub Release
 Write-Host "`nСоздаю GitHub Release v$ver..." -ForegroundColor Cyan
-gh release create "v$ver" ".\dist\app.exe" --title "v$ver" --generate-notes
+$releaseFiles = @(".\dist\app.exe")
+if (Test-Path ".\dist\RemoteDesktop.cer") {
+    $releaseFiles += ".\dist\RemoteDesktop.cer"
+}
+gh release create "v$ver" @releaseFiles --title "v$ver" --generate-notes
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`nРелиз v$ver опубликован!" -ForegroundColor Green
